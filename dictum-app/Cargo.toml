@@ -1,0 +1,47 @@
+[package]
+name = "dictum-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Dictum desktop application — Tauri host"
+
+[[bin]]
+name = "dictum-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
+[dependencies]
+dictum-core = { path = "../dictum-core", features = ["onnx", "audio-cpal"] }
+
+tauri = { workspace = true, features = [] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tauri-plugin-global-shortcut = "2"
+parking_lot = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# This feature is used for production builds where we embed the frontend
+custom-protocol = ["tauri/custom-protocol"]

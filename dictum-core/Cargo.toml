@@ -1,0 +1,51 @@
+[package]
+name = "dictum-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Dictum voice-to-text engine — reusable SDK"
+
+[features]
+default    = ["audio-cpal"]
+audio-cpal = ["dep:cpal"]
+onnx       = ["dep:ort", "dep:ndarray", "dep:rustfft", "dep:tokenizers", "dep:reqwest"]
+
+[dependencies]
+# Audio capture (feature-gated)
+cpal = { workspace = true, optional = true }
+
+# Resampling — always present (needed regardless of inference backend)
+rubato = { workspace = true }
+
+# ONNX inference — gated under `onnx` feature
+ort        = { workspace = true, optional = true }
+ndarray    = { workspace = true, optional = true }
+rustfft    = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+reqwest    = { workspace = true, optional = true }
+
+# Lock-free ring buffer
+ringbuf = { workspace = true }
+
+# Async runtime (for spawn_blocking in pipeline)
+tokio = { workspace = true }
+
+# Serialization (IPC events)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+# For VAD unit tests
+approx = "0.5"

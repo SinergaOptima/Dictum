@@ -1,0 +1,43 @@
+# Rust build artifacts
+/target/
+dictum-core/target/
+dictum-app/target/
+
+# Cargo lock is committed for binaries, not libraries
+# (workspace lock is at root)
+
+# Node / Next.js
+dictum-ui/node_modules/
+dictum-ui/.next/
+dictum-ui/out/
+dictum-ui/.env*.local
+
+# Tauri
+dictum-app/src-tauri/target/
+dictum-app/WixTools/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Models (large binary files)
+*.onnx
+*.bin
+*.pt
+*.gguf
+models/
+
+# Logs
+*.log
+logs/
+
+# Env files
+.env
+.env.local
