@@ -27,6 +27,8 @@ pub struct RateConverter {
     resampler: Option<FastFixedIn<f32>>,
     /// Accumulation buffer — holds partial input chunks between calls.
     input_buf: Vec<f32>,
+    /// Read offset into `input_buf` to avoid front-drain memmoves on every chunk.
+    input_start: usize,
     /// How many input samples rubato expects per process call.
     chunk_size: usize,
     /// Pre-allocated output buffer: `[1][output_frames_max]`.
@@ -48,6 +50,7 @@ impl RateConverter {
             return Ok(Self {
                 resampler: None,
                 input_buf: Vec::new(),
+                input_start: 0,
                 chunk_size,
                 output_buf: Vec::new(),
             });
@@ -79,7 +82,8 @@ impl RateConverter {
 
         Ok(Self {
             resampler: Some(resampler),
-            input_buf: Vec::new(),
+            input_buf: Vec::with_capacity(chunk_size * 4),
+            input_start: 0,
             chunk_size,
             output_buf,
         })
@@ -99,10 +103,13 @@ impl RateConverter {
 
         self.input_buf.extend_from_slice(samples);
 
-        let mut result = Vec::new();
+        let available = self.input_buf.len().saturating_sub(self.input_start);
+        let possible_chunks = available / self.chunk_size;
+        let mut result = Vec::with_capacity(possible_chunks * self.output_buf[0].len());
 
-        while self.input_buf.len() >= self.chunk_size {
-            let input_slice = &self.input_buf[..self.chunk_size];
+        while self.input_buf.len().saturating_sub(self.input_start) >= self.chunk_size {
+            let end = self.input_start + self.chunk_size;
+            let input_slice = &self.input_buf[self.input_start..end];
 
             match resampler.process_into_buffer(&[input_slice], &mut self.output_buf, None) {
                 Ok((_consumed, produced)) => {
@@ -113,7 +120,15 @@ impl RateConverter {
                 }
             }
 
-            self.input_buf.drain(..self.chunk_size);
+            self.input_start = end;
+        }
+
+        // Compact only when the consumed prefix becomes significant.
+        if self.input_start > 0 && (self.input_start >= self.chunk_size * 4 || self.input_start * 2 >= self.input_buf.len()) {
+            let remaining = self.input_buf.len() - self.input_start;
+            self.input_buf.copy_within(self.input_start.., 0);
+            self.input_buf.truncate(remaining);
+            self.input_start = 0;
         }
 
         result

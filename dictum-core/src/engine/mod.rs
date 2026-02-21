@@ -111,6 +111,8 @@ pub struct DictumEngine {
     activity_tx: broadcast::Sender<AudioActivityEvent>,
     /// Monotonically increasing event sequence counter.
     seq: Arc<AtomicU64>,
+    /// Shared pipeline diagnostics counters.
+    diagnostics: Arc<pipeline::PipelineDiagnostics>,
 }
 
 impl DictumEngine {
@@ -119,6 +121,7 @@ impl DictumEngine {
         let (transcript_tx, _) = broadcast::channel(BROADCAST_CAP);
         let (status_tx, _) = broadcast::channel(BROADCAST_CAP);
         let (activity_tx, _) = broadcast::channel(BROADCAST_CAP);
+        let diagnostics = Arc::new(pipeline::PipelineDiagnostics::default());
 
         Self {
             config,
@@ -129,6 +132,7 @@ impl DictumEngine {
             status_tx,
             activity_tx,
             seq: Arc::new(AtomicU64::new(0)),
+            diagnostics,
         }
     }
 
@@ -164,6 +168,7 @@ impl DictumEngine {
             return Err(DictumError::AlreadyRunning);
         }
 
+        self.diagnostics.reset();
         self.running.store(true, Ordering::SeqCst);
         self.set_status(EngineStatus::Listening, None);
 
@@ -178,6 +183,7 @@ impl DictumEngine {
         let activity_tx = self.activity_tx.clone();
         let status = Arc::clone(&self.status);
         let seq = Arc::clone(&self.seq);
+        let diagnostics = Arc::clone(&self.diagnostics);
         let preferred_input_device = preferred_input_device.clone();
 
         // Sync oneshot: pipeline thread signals open success/failure to start().
@@ -211,7 +217,7 @@ impl DictumEngine {
                     .silero_vad_path
                     .clone()
                     .unwrap_or_else(SileroVad::default_model_path);
-                let silero_threshold = config.silero_vad_threshold.clamp(0.05, 0.95);
+                let silero_threshold = config.silero_vad_threshold.clamp(0.03, 0.95);
                 match SileroVad::new(&path, silero_threshold) {
                     Ok(v) => {
                         info!(
@@ -237,7 +243,6 @@ impl DictumEngine {
             ));
 
             // ── Run pipeline ──────────────────────────────────────────────────────────
-            let diagnostics = Arc::new(pipeline::PipelineDiagnostics::default());
             pipeline::run(pipeline::PipelineContext {
                 config,
                 model,
@@ -312,6 +317,11 @@ impl DictumEngine {
     /// Subscribe to live voice activity events (RMS + speech classification).
     pub fn subscribe_activity(&self) -> broadcast::Receiver<AudioActivityEvent> {
         self.activity_tx.subscribe()
+    }
+
+    /// Snapshot of pipeline counters for observability.
+    pub fn pipeline_diagnostics_snapshot(&self) -> pipeline::DiagnosticsSnapshot {
+        self.diagnostics.snapshot()
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

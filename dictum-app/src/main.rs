@@ -32,14 +32,93 @@ use dictum_core::{
 };
 use parking_lot::Mutex;
 use settings::{apply_runtime_env_from_settings, default_settings_path, load_settings};
-use state::AppState;
+use state::{AppState, PerfMetrics};
 use storage::{HistoryRecordInput, LocalStore};
-use tauri::{Emitter, Manager};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
+};
 use tauri_plugin_global_shortcut::ShortcutState;
 use tracing::info;
 use transform::TextTransform;
 
-const GLOBAL_TOGGLE_SHORTCUT: &str = "Ctrl+Shift+Space";
+const DEFAULT_GLOBAL_TOGGLE_SHORTCUT: &str = "Ctrl+Shift+Space";
+const TRAY_SHOW_HIDE_ID: &str = "tray_show_hide";
+const TRAY_EXIT_ID: &str = "tray_exit";
+
+#[cfg(target_os = "windows")]
+fn enforce_single_instance() -> Option<isize> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
+        System::Threading::CreateMutexW,
+        UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE},
+    };
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let mutex_name = to_wide("Global\\DictumSingleInstance");
+    let mutex = unsafe { CreateMutexW(std::ptr::null(), true.into(), mutex_name.as_ptr()) };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let window_title = to_wide("Dictum");
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), window_title.as_ptr()) };
+        if !hwnd.is_null() {
+            unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+        return None;
+    }
+    Some(mutex as isize)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enforce_single_instance() -> Option<isize> {
+    Some(0)
+}
+
+fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
+    match profile {
+        "whisper_balanced_english" => {
+            // Higher whisper sensitivity while keeping enough hangover for quiet tails.
+            config.vad_threshold = 0.00125;
+            config.min_speech_samples = 460;
+            config.max_speech_samples = 96_000;
+            config.vad_hangover_frames = 7;
+            config.enable_partial_inference = false;
+            config.silero_vad_threshold = 0.045;
+        }
+        "latency_short_utterance" => {
+            config.vad_threshold = 0.00195;
+            config.min_speech_samples = 420;
+            config.max_speech_samples = 72_000;
+            config.vad_hangover_frames = 3;
+            config.enable_partial_inference = true;
+            config.silero_vad_threshold = 0.065;
+        }
+        "balanced_general" => {
+            config.vad_threshold = 0.0017;
+            config.min_speech_samples = 600;
+            config.max_speech_samples = 88_000;
+            config.vad_hangover_frames = 4;
+            config.enable_partial_inference = false;
+            config.silero_vad_threshold = 0.058;
+        }
+        _ => {
+            // stability_long_form (default)
+            config.vad_threshold = 0.00145;
+            config.min_speech_samples = 520;
+            config.max_speech_samples = 104_000;
+            config.vad_hangover_frames = 6;
+            config.enable_partial_inference = false;
+            config.silero_vad_threshold = 0.052;
+        }
+    }
+}
 
 fn toggle_engine_from_shortcut<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<AppState>();
@@ -70,9 +149,9 @@ fn ensure_pill_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Re
 
     tauri::WebviewWindowBuilder::new(app, "pill", tauri::WebviewUrl::App("pill".into()))
         .title("Dictum Pill")
-        .inner_size(152.0, 40.0)
-        .min_inner_size(152.0, 40.0)
-        .max_inner_size(152.0, 40.0)
+        .inner_size(240.0, 60.0)
+        .min_inner_size(240.0, 60.0)
+        .max_inner_size(240.0, 60.0)
         .resizable(false)
         .focused(false)
         .transparent(true)
@@ -83,6 +162,66 @@ fn ensure_pill_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Re
         .shadow(false)
         .background_color(tauri::window::Color(0, 0, 0, 0))
         .build()?;
+    Ok(())
+}
+
+fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let is_visible = window.is_visible().unwrap_or(false);
+        if is_visible {
+            let _ = window.hide();
+        } else {
+            reveal_main_window(app);
+        }
+    }
+}
+
+fn setup_system_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    let show_hide_item = MenuItem::with_id(
+        app,
+        TRAY_SHOW_HIDE_ID,
+        "Show / Hide Dictum",
+        true,
+        None::<&str>,
+    )?;
+    let exit_item = MenuItem::with_id(app, TRAY_EXIT_ID, "Exit Dictum", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show_hide_item, &exit_item])?;
+
+    let mut tray = TrayIconBuilder::with_id("dictum-tray")
+        .menu(&tray_menu)
+        .tooltip("Dictum")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id() == TRAY_SHOW_HIDE_ID {
+                toggle_main_window(app);
+            } else if event.id() == TRAY_EXIT_ID {
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+
+    tray.build(app)?;
     Ok(())
 }
 
@@ -121,6 +260,10 @@ fn main() {
         .init();
 
     info!("Dictum starting");
+    let _single_instance_guard = enforce_single_instance();
+    if _single_instance_guard.is_none() {
+        return;
+    }
 
     let settings_path = default_settings_path();
     let app_settings = load_settings(&settings_path);
@@ -128,6 +271,8 @@ fn main() {
     info!(
         settings_path = ?settings_path,
         model_profile = %app_settings.model_profile,
+        performance_profile = %app_settings.performance_profile,
+        toggle_shortcut = %app_settings.toggle_shortcut,
         ort_ep = %app_settings.ort_ep,
         "runtime settings loaded"
     );
@@ -149,15 +294,17 @@ fn main() {
     };
 
     let mut config = EngineConfig::default();
-    // Tune for global dictation: low-latency finalization plus stable long-form capture.
-    config.vad_threshold = 0.0022;
-    config.min_speech_samples = 800;
-    // Force periodic finalization during very long speech while preserving continuity.
-    config.max_speech_samples = 104_000;
-    config.vad_hangover_frames = 4;
-    // Partial inference during capture can starve the pipeline under long utterances.
-    config.enable_partial_inference = false;
-    config.silero_vad_threshold = 0.08;
+    apply_engine_profile(&mut config, &app_settings.performance_profile);
+    info!(
+        performance_profile = %app_settings.performance_profile,
+        vad_threshold = config.vad_threshold,
+        min_speech_samples = config.min_speech_samples,
+        max_speech_samples = config.max_speech_samples,
+        vad_hangover_frames = config.vad_hangover_frames,
+        enable_partial_inference = config.enable_partial_inference,
+        silero_vad_threshold = config.silero_vad_threshold,
+        "engine performance profile applied"
+    );
     let engine = Arc::new(DictumEngine::new(config, model));
 
     // Warm up the model before Tauri starts.
@@ -184,7 +331,13 @@ fn main() {
     let toggle_debounce = Arc::new(Mutex::new(None::<Instant>));
     let toggle_debounce_for_handler = Arc::clone(&toggle_debounce);
     let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(GLOBAL_TOGGLE_SHORTCUT)
+        .with_shortcut(
+            if app_settings.toggle_shortcut.trim().is_empty() {
+                DEFAULT_GLOBAL_TOGGLE_SHORTCUT
+            } else {
+                app_settings.toggle_shortcut.as_str()
+            },
+        )
         .expect("invalid global shortcut")
         .with_handler(move |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
@@ -205,7 +358,6 @@ fn main() {
             }
         })
         .build();
-
     let inject_calls = Arc::new(AtomicUsize::new(0));
     let inject_success = Arc::new(AtomicUsize::new(0));
     let final_segments_seen = Arc::new(AtomicUsize::new(0));
@@ -217,11 +369,14 @@ fn main() {
     let store_for_setup = Arc::clone(&store);
     let transformer_for_setup = Arc::clone(&transformer);
     let settings_for_setup = Arc::clone(&settings_state);
+    let perf_metrics = Arc::new(Mutex::new(PerfMetrics::default()));
+    let perf_metrics_for_setup = Arc::clone(&perf_metrics);
 
     tauri::Builder::default()
         .plugin(global_shortcut_plugin)
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            setup_system_tray(&app_handle)?;
 
             // ── Forward engine events → Tauri event bus ───────────────────
             // Use tauri::async_runtime::spawn to share Tauri's Tokio runtime.
@@ -235,9 +390,11 @@ fn main() {
             let store_clone = Arc::clone(&store_for_setup);
             let transformer_clone = Arc::clone(&transformer_for_setup);
             let settings_clone = Arc::clone(&settings_for_setup);
+            let perf_metrics_clone = Arc::clone(&perf_metrics_for_setup);
             let mut last_injected_text: Option<(String, Instant)> = None;
             let mut last_partial_text: Option<(String, Instant)> = None;
             tauri::async_runtime::spawn(async move {
+                let mut last_perf_log = Instant::now();
                 loop {
                     match transcript_rx.recv().await {
                         Ok(mut event) => {
@@ -256,6 +413,7 @@ fn main() {
                             let mut final_text_parts = Vec::new();
                             let mut dictionary_applied = false;
                             let mut snippet_applied = false;
+                            let transform_started = Instant::now();
                             for segment in event
                                 .segments
                                 .iter_mut()
@@ -269,6 +427,10 @@ fn main() {
                                 dictionary_applied |= transformed.dictionary_applied;
                                 snippet_applied |= transformed.snippet_applied;
                             }
+                            let transform_elapsed_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
+                            perf_metrics_clone
+                                .lock()
+                                .record_transform(transform_elapsed_ms);
 
                             if let Err(e) = handle1.emit("dictum://transcript", &event) {
                                 tracing::warn!("emit transcript: {e}");
@@ -277,6 +439,7 @@ fn main() {
                             let mut final_text = final_text_parts.join(" ");
                             let mut used_partial_rescue = false;
                             if !final_text.is_empty() {
+                                let finalize_started = Instant::now();
                                 final_segments_seen_clone.fetch_add(1, Ordering::Relaxed);
                                 let mut should_inject_and_persist = true;
                                 if is_redacted_transcript(&final_text) {
@@ -319,6 +482,11 @@ fn main() {
                                         now,
                                         Duration::from_millis(700),
                                     ) {
+                                        let finalize_elapsed_ms =
+                                            finalize_started.elapsed().as_secs_f64() * 1000.0;
+                                        perf_metrics_clone
+                                            .lock()
+                                            .record_finalize(finalize_elapsed_ms);
                                         tracing::warn!(
                                             "skipping duplicate final transcript within dedupe window"
                                         );
@@ -326,14 +494,19 @@ fn main() {
                                     }
                                     let to_type = format!("{final_text} ");
                                     inject_calls_clone.fetch_add(1, Ordering::Relaxed);
+                                    let inject_started = Instant::now();
                                     if let Err(e) = text_injector::inject_text(&to_type) {
                                         tracing::warn!("text injection failed: {e}");
                                     } else {
                                         inject_success_clone.fetch_add(1, Ordering::Relaxed);
                                         last_injected_text = Some((final_text.clone(), now));
                                     }
+                                    let inject_elapsed_ms =
+                                        inject_started.elapsed().as_secs_f64() * 1000.0;
+                                    perf_metrics_clone.lock().record_inject(inject_elapsed_ms);
                                     let settings_guard = settings_clone.lock();
                                     if settings_guard.history_enabled {
+                                        let persist_started = Instant::now();
                                         if let Err(e) = store_clone.insert_history(HistoryRecordInput {
                                             text: final_text.clone(),
                                             source: if settings_guard.cloud_opt_in {
@@ -347,8 +520,18 @@ fn main() {
                                         }) {
                                             tracing::warn!("failed to persist history: {e}");
                                         }
+                                        let persist_elapsed_ms =
+                                            persist_started.elapsed().as_secs_f64() * 1000.0;
+                                        perf_metrics_clone
+                                            .lock()
+                                            .record_persist(persist_elapsed_ms);
                                     }
                                 }
+                                let finalize_elapsed_ms =
+                                    finalize_started.elapsed().as_secs_f64() * 1000.0;
+                                perf_metrics_clone
+                                    .lock()
+                                    .record_finalize(finalize_elapsed_ms);
                                 tracing::info!(
                                     transcript_seq = event.seq,
                                     final_text_len = final_text.len(),
@@ -357,6 +540,18 @@ fn main() {
                                     inject_success = inject_success_clone.load(Ordering::Relaxed),
                                     "processed final transcript for text injection"
                                 );
+
+                                if last_perf_log.elapsed() >= Duration::from_secs(10) {
+                                    let snapshot = perf_metrics_clone.lock().snapshot();
+                                    tracing::debug!(
+                                        transform_p95_ms = snapshot.transform_ms.p95_ms,
+                                        inject_p95_ms = snapshot.inject_ms.p95_ms,
+                                        persist_p95_ms = snapshot.persist_ms.p95_ms,
+                                        finalize_p95_ms = snapshot.finalize_ms.p95_ms,
+                                        "perf snapshot"
+                                    );
+                                    last_perf_log = Instant::now();
+                                }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -418,6 +613,7 @@ fn main() {
             settings_path,
             store,
             transformer,
+            perf_metrics,
         })
         .invoke_handler(tauri::generate_handler![
             commands::start_engine,
@@ -428,6 +624,7 @@ fn main() {
             commands::get_preferred_input_device,
             commands::get_runtime_settings,
             commands::set_runtime_settings,
+            commands::get_perf_snapshot,
             commands::get_privacy_settings,
             commands::set_privacy_settings,
             commands::get_history,

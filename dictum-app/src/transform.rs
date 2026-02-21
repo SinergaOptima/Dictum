@@ -78,13 +78,16 @@ impl TextTransform {
                 continue;
             }
             let replaced = match snippet.mode.as_str() {
-                "phrase" => replace_word_case_aware(&out, trigger, expansion),
+                "phrase" => replace_word_case_insensitive(&out, trigger, expansion),
                 _ => replace_slash_trigger(&out, trigger, expansion),
             };
             if replaced != out {
                 snippet_applied = true;
                 out = replaced;
             }
+        }
+        if snippet_applied {
+            out = strip_terminal_period(&out);
         }
 
         TransformResult {
@@ -101,7 +104,7 @@ fn replace_slash_trigger(text: &str, trigger: &str, replacement: &str) -> String
     } else {
         format!("/{trigger}")
     };
-    replace_word_case_aware(text, &with_slash, replacement)
+    replace_word_case_insensitive(text, &with_slash, replacement)
 }
 
 fn is_word_char(c: char) -> bool {
@@ -145,6 +148,56 @@ fn replace_word_case_aware(text: &str, needle: &str, replacement: &str) -> Strin
     }
     if changed {
         out
+    } else {
+        text.to_string()
+    }
+}
+
+fn replace_word_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < chars.len() {
+        let rem: String = chars[i..].iter().collect();
+        if rem.to_ascii_lowercase().starts_with(&needle_lower) {
+            let start_ok = if i == 0 {
+                true
+            } else {
+                !is_word_char(chars[i - 1])
+            };
+            let end_idx = i + needle.chars().count();
+            let end_ok = if end_idx >= chars.len() {
+                true
+            } else {
+                !is_word_char(chars[end_idx])
+            };
+            if start_ok && end_ok {
+                out.push_str(replacement);
+                i = end_idx;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    if changed {
+        out
+    } else {
+        text.to_string()
+    }
+}
+
+fn strip_terminal_period(text: &str) -> String {
+    let trimmed_end = text.trim_end();
+    if let Some(without_period) = trimmed_end.strip_suffix('.') {
+        without_period.trim_end().to_string()
     } else {
         text.to_string()
     }

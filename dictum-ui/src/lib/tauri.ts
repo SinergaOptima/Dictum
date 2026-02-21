@@ -19,6 +19,7 @@ import type {
   RuntimeSettings,
   SnippetEntry,
   StatsPayload,
+  PerfSnapshot,
 } from "@shared/ipc_types";
 
 // ---------------------------------------------------------------------------
@@ -54,20 +55,43 @@ export const getRuntimeSettings = (): Promise<RuntimeSettings> =>
 
 export const setRuntimeSettings = (
   modelProfile?: string | null,
+  performanceProfile?: string | null,
+  toggleShortcut?: string | null,
   ortEp?: string | null,
   languageHint?: string | null,
+  pillVisualizerSensitivity?: number | null,
+  activitySensitivity?: number | null,
+  activityNoiseGate?: number | null,
+  activityClipThreshold?: number | null,
+  inputGainBoost?: number | null,
+  postUtteranceRefine?: boolean | null,
+  phraseBiasTerms?: string[] | null,
+  openAiApiKey?: string | null,
   cloudOptIn?: boolean | null,
   historyEnabled?: boolean | null,
   retentionDays?: number | null,
 ): Promise<RuntimeSettings> =>
   tauriInvoke("set_runtime_settings", {
     modelProfile: modelProfile ?? null,
+    performanceProfile: performanceProfile ?? null,
+    toggleShortcut: toggleShortcut ?? null,
     ortEp: ortEp ?? null,
     languageHint: languageHint ?? null,
+    pillVisualizerSensitivity: pillVisualizerSensitivity ?? null,
+    activitySensitivity: activitySensitivity ?? null,
+    activityNoiseGate: activityNoiseGate ?? null,
+    activityClipThreshold: activityClipThreshold ?? null,
+    inputGainBoost: inputGainBoost ?? null,
+    postUtteranceRefine: postUtteranceRefine ?? null,
+    phraseBiasTerms: phraseBiasTerms ?? null,
+    openAiApiKey: openAiApiKey ?? null,
     cloudOptIn: cloudOptIn ?? null,
     historyEnabled: historyEnabled ?? null,
     retentionDays: retentionDays ?? null,
   });
+
+export const getPerfSnapshot = (): Promise<PerfSnapshot> =>
+  tauriInvoke("get_perf_snapshot");
 
 export const getPrivacySettings = (): Promise<PrivacySettings> =>
   tauriInvoke("get_privacy_settings");

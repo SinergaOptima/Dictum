@@ -2,14 +2,11 @@
 pub fn inject_text(text: &str) -> Result<(), String> {
     use std::{thread, time::Duration};
 
-    const CHUNK_UNITS: usize = 160;
-    const RETRIES: usize = 2;
-    const CLIPBOARD_RESTORE_DELAY_MS: u64 = 60;
-
     let mut units: Vec<u16> = text.encode_utf16().collect();
     if units.is_empty() {
         return Ok(());
     }
+    let tuning = inject_tuning(units.len());
 
     // Convert LF to CR so Enter behavior is consistent in classic Win32 apps.
     for unit in &mut units {
@@ -30,7 +27,7 @@ pub fn inject_text(text: &str) -> Result<(), String> {
             // Fall through to Unicode path; some apps reject simulated paste.
             tracing::debug!(error = %e, process = %target_proc, "clipboard paste injection failed; falling back to unicode");
         } else {
-            thread::sleep(Duration::from_millis(CLIPBOARD_RESTORE_DELAY_MS));
+            thread::sleep(Duration::from_millis(tuning.clipboard_restore_delay_ms));
             return Ok(());
         }
     }
@@ -39,9 +36,9 @@ pub fn inject_text(text: &str) -> Result<(), String> {
         return Err("clipboard paste injection failed".into());
     }
 
-    for chunk in units.chunks(CHUNK_UNITS) {
+    for chunk in units.chunks(tuning.chunk_units) {
         let mut last_err: Option<String> = None;
-        for attempt in 0..RETRIES {
+        for attempt in 0..tuning.retries {
             match send_unicode_chunk(chunk) {
                 Ok(()) => {
                     last_err = None;
@@ -49,8 +46,8 @@ pub fn inject_text(text: &str) -> Result<(), String> {
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt + 1 < RETRIES {
-                        thread::sleep(Duration::from_millis(6));
+                    if attempt + 1 < tuning.retries {
+                        thread::sleep(Duration::from_millis(tuning.retry_delay_ms));
                     }
                 }
             }
@@ -69,6 +66,56 @@ enum InjectMethod {
     Auto,
     Unicode,
     Paste,
+}
+
+#[cfg(target_os = "windows")]
+struct InjectTuning {
+    chunk_units: usize,
+    retries: usize,
+    retry_delay_ms: u64,
+    clipboard_restore_delay_ms: u64,
+}
+
+#[cfg(target_os = "windows")]
+fn inject_tuning(total_units: usize) -> InjectTuning {
+    let base_chunk = env_usize("DICTUM_INJECT_CHUNK_UNITS", 160, 48, 640);
+    let adaptive_chunk = if total_units >= 4_000 {
+        (base_chunk * 2).min(640)
+    } else if total_units >= 1_600 {
+        (base_chunk * 3 / 2).min(480)
+    } else {
+        base_chunk
+    };
+
+    InjectTuning {
+        chunk_units: adaptive_chunk.max(1),
+        retries: env_usize("DICTUM_INJECT_RETRIES", 2, 1, 5),
+        retry_delay_ms: env_u64("DICTUM_INJECT_RETRY_DELAY_MS", 6, 1, 40),
+        clipboard_restore_delay_ms: env_u64(
+            "DICTUM_INJECT_CLIPBOARD_RESTORE_DELAY_MS",
+            60,
+            10,
+            250,
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn env_usize(key: &str, default_value: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default_value)
+}
+
+#[cfg(target_os = "windows")]
+fn env_u64(key: &str, default_value: u64, min: u64, max: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default_value)
 }
 
 #[cfg(target_os = "windows")]

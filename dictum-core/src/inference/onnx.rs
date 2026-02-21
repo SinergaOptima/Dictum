@@ -92,6 +92,25 @@ fn cloud_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn post_utterance_refinement_enabled() -> bool {
+    std::env::var("DICTUM_POST_UTTERANCE_REFINEMENT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn phrase_bias_terms_from_env() -> Vec<String> {
+    std::env::var("DICTUM_PHRASE_BIAS_TERMS")
+        .ok()
+        .map(|raw| {
+            raw.lines()
+                .flat_map(|line| line.split(','))
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 // ── Mel spectrogram constants ────────────────────────────────────────────────
 const N_FFT: usize = 400;
 // Whisper expects an n_fft=400 STFT frontend (201 freq bins).
@@ -115,7 +134,8 @@ const REPEAT_TOKEN_BREAK_THRESHOLD: usize = 14;
 const NO_REPEAT_NGRAM_SIZE: usize = 0;
 const MAX_TOKEN_TAIL_HISTORY: usize = 64;
 const MAX_TAIL_TOKEN_OCCURRENCES: usize = 14;
-const TOKEN_REPEAT_PENALTY: f32 = 0.18;
+const TOKEN_REPEAT_PENALTY: f32 = 0.14;
+const PHRASE_BIAS_LOGIT_BOOST: f32 = 0.45;
 const TOKENS_PER_SECOND_ESTIMATE: f32 = 6.8;
 const DECODE_TOKEN_OVERHEAD: usize = 12;
 
@@ -407,6 +427,7 @@ impl OnnxModel {
         timestamp_begin: Option<i64>,
         begin_suppress_tokens: &[i64],
         always_suppress_tokens: &[i64],
+        phrase_bias_token_ids: &HashSet<i64>,
         partial: bool,
     ) -> Result<Vec<i64>> {
         let max_steps = max_decode_steps.clamp(1, MAX_TOKENS);
@@ -555,7 +576,12 @@ impl OnnxModel {
                     |(best_non_ts, best_any), (i, &v)| {
                         let token_id = i as i64;
                         let tail_count = tail_counts.get(&token_id).copied().unwrap_or(0);
-                        let penalized = v - TOKEN_REPEAT_PENALTY * tail_count as f32;
+                        let phrase_bias = if phrase_bias_token_ids.contains(&token_id) {
+                            PHRASE_BIAS_LOGIT_BOOST
+                        } else {
+                            0.0
+                        };
+                        let penalized = v + phrase_bias - TOKEN_REPEAT_PENALTY * tail_count as f32;
                         let suppressed_for_begin =
                             step == 0 && begin_suppress_tokens.contains(&token_id);
                         let suppressed_always = always_suppress_tokens.contains(&token_id);
@@ -919,6 +945,8 @@ impl SpeechModel for OnnxModel {
                 }
                 Ok((text, None))
             };
+        let phrase_bias_terms = phrase_bias_terms_from_env();
+        let phrase_bias_token_ids = phrase_bias_token_ids(tokenizer, &phrase_bias_terms);
 
         let debug_mode = is_debug_transcribe();
         let mut tokens = Vec::new();
@@ -943,11 +971,11 @@ impl SpeechModel for OnnxModel {
             max_decode_steps
         } else {
             let short_cap = if audio_seconds <= 4.0 {
-                64
-            } else if audio_seconds <= 8.0 {
                 96
-            } else {
+            } else if audio_seconds <= 8.0 {
                 128
+            } else {
+                160
             };
             max_decode_steps.clamp(MIN_FINAL_TOKENS, short_cap)
         };
@@ -973,6 +1001,7 @@ impl SpeechModel for OnnxModel {
                     timestamp_begin,
                     &begin_suppress_tokens,
                     &always_suppress_tokens,
+                    &phrase_bias_token_ids,
                     partial,
                 )?;
                 let generated_len = candidate_tokens.len().saturating_sub(prefix.len());
@@ -1055,6 +1084,37 @@ impl SpeechModel for OnnxModel {
             }
         }
 
+        if !partial
+            && post_utterance_refinement_enabled()
+            && !text.is_empty()
+            && audio_seconds >= 5.0
+        {
+            let refine_decode_steps = max_decode_steps
+                .saturating_add(48)
+                .clamp(MIN_FINAL_TOKENS, MAX_TOKENS);
+            let mut best_refine_text = text.clone();
+            let mut best_score = transcript_quality_score(&best_refine_text, audio_seconds);
+            let best_words = best_refine_text.split_whitespace().count().max(1);
+            for prefix in &decode_prefixes {
+                let (candidate, _) = try_prefix(prefix, refine_decode_steps)?;
+                if let Some(candidate_text) = candidate {
+                    if is_low_quality_transcript_text(&candidate_text, audio_seconds) {
+                        continue;
+                    }
+                    let candidate_words = candidate_text.split_whitespace().count();
+                    if audio_seconds <= 8.0 && candidate_words > best_words.saturating_mul(2) {
+                        continue;
+                    }
+                    let candidate_score = transcript_quality_score(&candidate_text, audio_seconds);
+                    if candidate_score > best_score + 0.7 {
+                        best_refine_text = candidate_text;
+                        best_score = candidate_score;
+                    }
+                }
+            }
+            text = best_refine_text;
+        }
+
         if text.is_empty() && !partial {
             if let Some(fallback_text) =
                 openai_cloud_fallback_text(&chunk.samples, chunk.sample_rate)
@@ -1105,9 +1165,9 @@ impl SpeechModel for OnnxModel {
 
         Ok(vec![TranscriptSegment {
             id: self.utterance_count.to_string(),
-            text,
+            text: text.clone(),
             kind,
-            confidence: None,
+            confidence: estimate_segment_confidence(&text, audio_seconds, partial),
         }])
     }
 
@@ -1228,6 +1288,12 @@ fn postprocess_transcript_text(text: &str) -> String {
     }
     let mut out = compact.trim().to_string();
 
+    // Remove leading punctuation artifacts from decoder restarts.
+    out = out
+        .trim_start_matches(|ch: char| matches!(ch, ',' | ';' | ':' | '.' | '!' | '?'))
+        .trim_start()
+        .to_string();
+
     // Uppercase standalone "i" pronoun.
     out = out
         .split_whitespace()
@@ -1274,12 +1340,12 @@ fn is_degenerate_transcript_text(text: &str) -> bool {
         .map(normalize_word_for_repetition)
         .filter(|w| !w.is_empty())
         .collect();
-    if words.len() < 8 {
+    if words.len() < 6 {
         return false;
     }
 
     let unique: HashSet<&str> = words.iter().map(|w| w.as_str()).collect();
-    if unique.len() <= 2 {
+    if unique.len() <= 2 && words.len() >= 6 {
         return true;
     }
     if words.len() >= 12 && unique.len().saturating_mul(100) / words.len() <= 30 {
@@ -1290,7 +1356,7 @@ fn is_degenerate_transcript_text(text: &str) -> bool {
         return true;
     }
 
-    has_repeating_phrase_words(&words, 1, 4)
+    has_repeating_phrase_words(&words, 1, 3)
         || has_repeating_phrase_words(&words, 2, 3)
         || has_repeating_phrase_words(&words, 3, 3)
 }
@@ -1303,7 +1369,10 @@ fn is_low_quality_transcript_text(text: &str, audio_seconds: f32) -> bool {
         return true;
     }
     let words = text.split_whitespace().count();
-    if audio_seconds >= 6.0 && words <= 2 {
+    if audio_seconds >= 8.0 && words <= 1 {
+        return true;
+    }
+    if audio_seconds >= 14.0 && words <= 2 {
         return true;
     }
     false
@@ -1401,6 +1470,62 @@ fn likely_truncated_transcript(text: &str, audio_seconds: f32) -> bool {
         return true;
     }
     false
+}
+
+fn phrase_bias_token_ids(tokenizer: &Tokenizer, terms: &[String]) -> HashSet<i64> {
+    if terms.is_empty() {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    for term in terms {
+        for form in [
+            term.clone(),
+            format!(" {term}"),
+            term.to_ascii_uppercase(),
+            format!(" {}", term.to_ascii_uppercase()),
+        ] {
+            if let Some(id) = tokenizer.token_to_id(&form) {
+                out.insert(id as i64);
+            }
+        }
+    }
+    out
+}
+
+fn transcript_quality_score(text: &str, audio_seconds: f32) -> f32 {
+    let words = text.split_whitespace().count() as f32;
+    let chars = text.chars().count() as f32;
+    let punctuation_bonus = if text.ends_with('.') || text.ends_with('!') || text.ends_with('?') {
+        0.15
+    } else {
+        0.0
+    };
+    let truncation_penalty = if likely_truncated_transcript(text, audio_seconds) {
+        0.8
+    } else {
+        0.0
+    };
+    let repetition_penalty = if is_degenerate_transcript_text(text) {
+        2.2
+    } else {
+        0.0
+    };
+    (words * 0.55 + chars * 0.015 + punctuation_bonus) - truncation_penalty - repetition_penalty
+}
+
+fn estimate_segment_confidence(text: &str, audio_seconds: f32, partial: bool) -> Option<f32> {
+    if partial || text.trim().is_empty() {
+        return None;
+    }
+    let words = text.split_whitespace().count() as f32;
+    let mut confidence = 0.52 + (words.min(18.0) * 0.02);
+    if likely_truncated_transcript(text, audio_seconds) {
+        confidence -= 0.18;
+    }
+    if is_low_quality_transcript_text(text, audio_seconds) {
+        confidence -= 0.24;
+    }
+    Some(confidence.clamp(0.05, 0.98))
 }
 
 fn openai_cloud_fallback_text(samples: &[f32], sample_rate: u32) -> Option<String> {

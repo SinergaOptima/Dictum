@@ -121,10 +121,34 @@ export interface DeviceInfo {
 export interface RuntimeSettings {
   /** Whisper model profile name, e.g. "small", "small.en", "large-v3-turbo". */
   modelProfile: string;
+  /** Runtime performance profile preset. */
+  performanceProfile:
+    | "whisper_balanced_english"
+    | "stability_long_form"
+    | "balanced_general"
+    | "latency_short_utterance";
+  /** Global push-to-talk toggle shortcut. */
+  toggleShortcut: string;
   /** ONNX execution provider preference: "auto" | "cpu" | "directml". */
   ortEp: string;
   /** Decode hint: "auto" | "english" | "mandarin" | "russian". */
   languageHint: string;
+  /** Pill visualizer sensitivity multiplier in [1, 20]. */
+  pillVisualizerSensitivity: number;
+  /** Activity meter sensitivity multiplier in [1, 20]. */
+  activitySensitivity: number;
+  /** Activity noise gate in RMS units. */
+  activityNoiseGate: number;
+  /** Approximate clipping threshold in RMS units. */
+  activityClipThreshold: number;
+  /** Input adaptive gain multiplier in [0.5, 8]. */
+  inputGainBoost: number;
+  /** Enables an additional quality-focused decode pass for final utterances. */
+  postUtteranceRefine: boolean;
+  /** Phrase bias terms for domain vocabulary boosting. */
+  phraseBiasTerms: string[];
+  /** Whether an OpenAI API key is stored locally. */
+  hasOpenAiApiKey: boolean;
   /** Whether cloud fallback is enabled. */
   cloudOptIn: boolean;
   /** Whether transcript history is persisted. */
@@ -197,4 +221,36 @@ export interface PrivacySettings {
   historyEnabled: boolean;
   retentionDays: number;
   cloudOptIn: boolean;
+}
+
+export interface PerfStageSnapshot {
+  count: number;
+  meanMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  p99Ms: number;
+  maxMs: number;
+}
+
+export interface AppDiagnostics {
+  injectCalls: number;
+  injectSuccess: number;
+  finalSegmentsSeen: number;
+  fallbackStubTyped: number;
+  pipelineFramesIn: number;
+  pipelineFramesResampled: number;
+  pipelineVadWindows: number;
+  pipelineVadSpeech: number;
+  pipelineInferenceCalls: number;
+  pipelineInferenceErrors: number;
+  pipelineSegmentsEmitted: number;
+  pipelineFallbackEmitted: number;
+}
+
+export interface PerfSnapshot {
+  diagnostics: AppDiagnostics;
+  transformMs: PerfStageSnapshot;
+  injectMs: PerfStageSnapshot;
+  persistMs: PerfStageSnapshot;
+  finalizeMs: PerfStageSnapshot;
 }

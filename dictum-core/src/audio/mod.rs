@@ -126,96 +126,124 @@ impl AudioCapture {
         let running_u8 = Arc::clone(&running);
 
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |data: &[f32], _info| {
-                    if !running_f32.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    if channels == 1 {
-                        let written = producer.push_slice(data);
-                        if written < data.len() {
-                            warn!(
-                                "ring buffer full: dropped {} f32 frames",
-                                data.len() - written
-                            );
+            SampleFormat::F32 => {
+                let ch = channels as usize;
+                let mut mix_buf_f32: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _info| {
+                        if !running_f32.load(Ordering::Relaxed) {
+                            return;
                         }
-                    } else {
-                        let ch = channels as usize;
+                        if channels == 1 {
+                            let written = producer.push_slice(data);
+                            if written < data.len() {
+                                warn!(
+                                    "ring buffer full: dropped {} f32 frames",
+                                    data.len() - written
+                                );
+                            }
+                            return;
+                        }
+
                         let frames = data.len() / ch;
-                        let mut dropped = 0usize;
+                        mix_buf_f32.resize(frames, 0.0);
                         for f in 0..frames {
                             let mut sum = 0f32;
+                            let base = f * ch;
                             for c in 0..ch {
-                                sum += data[f * ch + c];
+                                sum += data[base + c];
                             }
-                            let pushed = producer.push_iter(std::iter::once(sum / ch as f32));
-                            if pushed == 0 {
-                                dropped += 1;
+                            mix_buf_f32[f] = sum / ch as f32;
+                        }
+                        let written = producer.push_slice(&mix_buf_f32);
+                        if written < mix_buf_f32.len() {
+                            warn!(
+                                "ring buffer full: dropped {} f32 frames",
+                                mix_buf_f32.len() - written
+                            );
+                        }
+                    },
+                    |err| error!("audio stream error: {err}"),
+                    None,
+                )
+            }
+
+            SampleFormat::I16 => {
+                let ch = channels as usize;
+                let mut mix_buf_i16: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _info| {
+                        if !running_i16.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let frames = data.len() / ch;
+                        mix_buf_i16.resize(frames, 0.0);
+                        if ch == 1 {
+                            for (idx, sample) in data.iter().take(frames).enumerate() {
+                                mix_buf_i16[idx] = *sample as f32 / 32768.0;
+                            }
+                        } else {
+                            for f in 0..frames {
+                                let mut sum = 0f32;
+                                let base = f * ch;
+                                for c in 0..ch {
+                                    sum += data[base + c] as f32 / 32768.0;
+                                }
+                                mix_buf_i16[f] = sum / ch as f32;
                             }
                         }
-                        if dropped > 0 {
-                            warn!("ring buffer full: dropped {} f32 frames", dropped);
+                        let written = producer.push_slice(&mix_buf_i16);
+                        if written < mix_buf_i16.len() {
+                            warn!(
+                                "ring buffer full: dropped {} i16 frames",
+                                mix_buf_i16.len() - written
+                            );
                         }
-                    }
-                },
-                |err| error!("audio stream error: {err}"),
-                None,
-            ),
+                    },
+                    |err| error!("audio stream error: {err}"),
+                    None,
+                )
+            }
 
-            SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |data: &[i16], _info| {
-                    if !running_i16.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let ch = channels as usize;
-                    let frames = data.len() / ch;
-                    let mut dropped = 0usize;
-                    for f in 0..frames {
-                        let mut sum = 0f32;
-                        for c in 0..ch {
-                            sum += data[f * ch + c] as f32 / 32768.0;
+            SampleFormat::U8 => {
+                let ch = channels as usize;
+                let mut mix_buf_u8: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u8], _info| {
+                        if !running_u8.load(Ordering::Relaxed) {
+                            return;
                         }
-                        let pushed = producer.push_iter(std::iter::once(sum / ch as f32));
-                        if pushed == 0 {
-                            dropped += 1;
+                        let frames = data.len() / ch;
+                        mix_buf_u8.resize(frames, 0.0);
+                        if ch == 1 {
+                            for (idx, sample) in data.iter().take(frames).enumerate() {
+                                mix_buf_u8[idx] = (*sample as f32 - 128.0) / 128.0;
+                            }
+                        } else {
+                            for f in 0..frames {
+                                let mut sum = 0f32;
+                                let base = f * ch;
+                                for c in 0..ch {
+                                    sum += (data[base + c] as f32 - 128.0) / 128.0;
+                                }
+                                mix_buf_u8[f] = sum / ch as f32;
+                            }
                         }
-                    }
-                    if dropped > 0 {
-                        warn!("ring buffer full: dropped {} i16 frames", dropped);
-                    }
-                },
-                |err| error!("audio stream error: {err}"),
-                None,
-            ),
-
-            SampleFormat::U8 => device.build_input_stream(
-                &config,
-                move |data: &[u8], _info| {
-                    if !running_u8.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let ch = channels as usize;
-                    let frames = data.len() / ch;
-                    let mut dropped = 0usize;
-                    for f in 0..frames {
-                        let mut sum = 0f32;
-                        for c in 0..ch {
-                            sum += (data[f * ch + c] as f32 - 128.0) / 128.0;
+                        let written = producer.push_slice(&mix_buf_u8);
+                        if written < mix_buf_u8.len() {
+                            warn!(
+                                "ring buffer full: dropped {} u8 frames",
+                                mix_buf_u8.len() - written
+                            );
                         }
-                        let pushed = producer.push_iter(std::iter::once(sum / ch as f32));
-                        if pushed == 0 {
-                            dropped += 1;
-                        }
-                    }
-                    if dropped > 0 {
-                        warn!("ring buffer full: dropped {} u8 frames", dropped);
-                    }
-                },
-                |err| error!("audio stream error: {err}"),
-                None,
-            ),
+                    },
+                    |err| error!("audio stream error: {err}"),
+                    None,
+                )
+            }
 
             fmt => {
                 return Err(DictumError::AudioStream(format!(

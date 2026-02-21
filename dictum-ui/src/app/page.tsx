@@ -56,6 +56,13 @@ const ORT_EP_OPTIONS = [
   { value: "cpu", label: "CPU" },
 ];
 
+const PERFORMANCE_PROFILE_OPTIONS = [
+  { value: "whisper_balanced_english", label: "Whisper Balanced (English)" },
+  { value: "stability_long_form", label: "Stability (Long Form)" },
+  { value: "balanced_general", label: "Balanced" },
+  { value: "latency_short_utterance", label: "Latency (Short Utterance)" },
+];
+
 const LANGUAGE_HINT_OPTIONS = [
   { value: "auto", label: "Auto" },
   { value: "english", label: "English" },
@@ -63,25 +70,62 @@ const LANGUAGE_HINT_OPTIONS = [
   { value: "russian", label: "Russian" },
 ];
 
+const MIC_CALIBRATION_STORAGE_KEY = "dictum-mic-calibration-v1";
+
+type MicCalibration = {
+  pillVisualizerSensitivity: number;
+  activitySensitivity: number;
+  activityNoiseGate: number;
+  activityClipThreshold: number;
+  inputGainBoost: number;
+};
+
+const clamp = (v: number, min: number, max: number): number => Math.min(max, Math.max(min, v));
+
+const percentile = (samples: number[], p: number): number => {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.floor((sorted.length - 1) * clamp(p, 0, 1));
+  return sorted[idx] ?? 0;
+};
+
 export default function Home() {
   const { isListening, status, startEngine, stopEngine, error } = useEngine();
-  const { isSpeech, level } = useActivity();
+  const [activitySensitivity, setActivitySensitivity] = useState(4.2);
+  const [activityNoiseGate, setActivityNoiseGate] = useState(0.0015);
+  const [activityClipThreshold, setActivityClipThreshold] = useState(0.32);
+  const { isSpeech, level, rawRms, isNoisy, isClipping } = useActivity({
+    sensitivity: activitySensitivity,
+    noiseGate: activityNoiseGate,
+    clipThreshold: activityClipThreshold,
+  });
   const { segments, clearSegments } = useTranscript();
   const { defaultDevice, devices, loading } = useAudioDevices();
 
   const feedRef = useRef<HTMLDivElement>(null);
   const pushToTalkRef = useRef(false);
+  const latestRmsRef = useRef(0);
 
   const [tab, setTab] = useState<Tab>("live");
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const [selectedDeviceName, setSelectedDeviceName] = useState<string | null>(null);
   const [modelProfile, setModelProfile] = useState("large-v3-turbo");
+  const [performanceProfile, setPerformanceProfile] = useState("whisper_balanced_english");
+  const [toggleShortcut, setToggleShortcut] = useState("Ctrl+Shift+Space");
   const [ortEp, setOrtEp] = useState("auto");
-  const [languageHint, setLanguageHint] = useState("auto");
+  const [languageHint, setLanguageHint] = useState("english");
+  const [pillVisualizerSensitivity, setPillVisualizerSensitivity] = useState(10);
+  const [inputGainBoost, setInputGainBoost] = useState(1);
+  const [postUtteranceRefine, setPostUtteranceRefine] = useState(false);
+  const [phraseBiasTerms, setPhraseBiasTerms] = useState("");
+  const [openAiApiKeyInput, setOpenAiApiKeyInput] = useState("");
+  const [hasOpenAiApiKey, setHasOpenAiApiKey] = useState(false);
   const [cloudOptIn, setCloudOptIn] = useState(false);
   const [historyEnabled, setHistoryEnabled] = useState(true);
   const [retentionDays, setRetentionDays] = useState(90);
   const [runtimeMsg, setRuntimeMsg] = useState<string | null>(null);
+  const [calibrationMsg, setCalibrationMsg] = useState<string | null>(null);
+  const [isCalibrating, setIsCalibrating] = useState(false);
 
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [historyQuery, setHistoryQuery] = useState("");
@@ -108,6 +152,10 @@ export default function Home() {
   }, [segments]);
 
   useEffect(() => {
+    latestRmsRef.current = rawRms;
+  }, [rawRms]);
+
+  useEffect(() => {
     getPreferredInputDevice()
       .then((name) => setSelectedDeviceName(name))
       .catch((err) => console.warn("Could not fetch preferred input device:", err));
@@ -117,8 +165,18 @@ export default function Home() {
     Promise.all([getRuntimeSettings(), getPrivacySettings()])
       .then(([runtime, privacy]) => {
         setModelProfile(runtime.modelProfile || "large-v3-turbo");
+        setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
+        setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(runtime.ortEp || "auto");
-        setLanguageHint(runtime.languageHint || "auto");
+        setLanguageHint(runtime.languageHint || "english");
+        setPillVisualizerSensitivity(runtime.pillVisualizerSensitivity || 10);
+        setActivitySensitivity(runtime.activitySensitivity || 4.2);
+        setActivityNoiseGate(runtime.activityNoiseGate ?? 0.0015);
+        setActivityClipThreshold(runtime.activityClipThreshold ?? 0.32);
+        setInputGainBoost(runtime.inputGainBoost || 1);
+        setPostUtteranceRefine(runtime.postUtteranceRefine ?? false);
+        setPhraseBiasTerms((runtime.phraseBiasTerms || []).join("\n"));
+        setHasOpenAiApiKey(runtime.hasOpenAiApiKey ?? false);
         setCloudOptIn(privacy.cloudOptIn);
         setHistoryEnabled(privacy.historyEnabled);
         setRetentionDays(privacy.retentionDays ?? 90);
@@ -127,10 +185,41 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (performanceProfile === "whisper_balanced_english" && languageHint !== "english") {
+      setLanguageHint("english");
+    }
+  }, [performanceProfile, languageHint]);
+
+  useEffect(() => {
     if (!selectedDeviceName && defaultDevice?.name) {
       setSelectedDeviceName(defaultDevice.name);
     }
   }, [defaultDevice, selectedDeviceName]);
+
+  useEffect(() => {
+    if (!selectedDeviceName) return;
+    try {
+      const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
+      if (!raw) return;
+      const all = JSON.parse(raw) as Record<string, MicCalibration>;
+      const profile = all[selectedDeviceName];
+      if (!profile) return;
+      setPillVisualizerSensitivity(profile.pillVisualizerSensitivity);
+      setActivitySensitivity(profile.activitySensitivity);
+      setActivityNoiseGate(profile.activityNoiseGate);
+      setActivityClipThreshold(profile.activityClipThreshold);
+      setInputGainBoost(profile.inputGainBoost);
+      void applyRuntime({
+        pillVisualizerSensitivity: profile.pillVisualizerSensitivity,
+        activitySensitivity: profile.activitySensitivity,
+        activityNoiseGate: profile.activityNoiseGate,
+        activityClipThreshold: profile.activityClipThreshold,
+        inputGainBoost: profile.inputGainBoost,
+      });
+    } catch {
+      // Ignore malformed local calibration cache.
+    }
+  }, [selectedDeviceName]);
 
   useEffect(() => {
     if (copyState === "idle") return;
@@ -159,44 +248,205 @@ export default function Home() {
   const applyRuntime = useCallback(
     async (overrides?: Partial<{
       modelProfile: string;
+      performanceProfile: string;
+      toggleShortcut: string;
       ortEp: string;
       languageHint: string;
+      pillVisualizerSensitivity: number;
+      activitySensitivity: number;
+      activityNoiseGate: number;
+      activityClipThreshold: number;
+      inputGainBoost: number;
+      postUtteranceRefine: boolean;
+      phraseBiasTerms: string[];
+      openAiApiKey: string | null;
       cloudOptIn: boolean;
       historyEnabled: boolean;
       retentionDays: number;
     }>) => {
       const next = {
         modelProfile,
+        performanceProfile,
+        toggleShortcut,
         ortEp,
         languageHint,
+        pillVisualizerSensitivity,
+        activitySensitivity,
+        activityNoiseGate,
+        activityClipThreshold,
+        inputGainBoost,
+        postUtteranceRefine,
+        phraseBiasTerms: phraseBiasTerms
+          .split(/\r?\n|,/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+        openAiApiKey: openAiApiKeyInput.trim() ? openAiApiKeyInput.trim() : null,
         cloudOptIn,
         historyEnabled,
         retentionDays,
         ...overrides,
       };
+      if (next.performanceProfile === "whisper_balanced_english") {
+        next.languageHint = "english";
+      }
       try {
         const updated = await setRuntimeSettings(
           next.modelProfile,
+          next.performanceProfile,
+          next.toggleShortcut,
           next.ortEp,
           next.languageHint,
+          next.pillVisualizerSensitivity,
+          next.activitySensitivity,
+          next.activityNoiseGate,
+          next.activityClipThreshold,
+          next.inputGainBoost,
+          next.postUtteranceRefine,
+          next.phraseBiasTerms,
+          next.openAiApiKey,
           next.cloudOptIn,
           next.historyEnabled,
           next.retentionDays,
         );
         setModelProfile(updated.modelProfile || "large-v3-turbo");
+        setPerformanceProfile(updated.performanceProfile || "whisper_balanced_english");
+        setToggleShortcut(updated.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(updated.ortEp || "auto");
-        setLanguageHint(updated.languageHint || "auto");
+        setLanguageHint(updated.languageHint || "english");
+        setPillVisualizerSensitivity(updated.pillVisualizerSensitivity || 10);
+        setActivitySensitivity(updated.activitySensitivity || 4.2);
+        setActivityNoiseGate(updated.activityNoiseGate ?? 0.0015);
+        setActivityClipThreshold(updated.activityClipThreshold ?? 0.32);
+        setInputGainBoost(updated.inputGainBoost || 1);
+        setPostUtteranceRefine(updated.postUtteranceRefine ?? false);
+        setPhraseBiasTerms((updated.phraseBiasTerms || []).join("\n"));
+        setHasOpenAiApiKey(updated.hasOpenAiApiKey ?? false);
+        if (next.openAiApiKey !== null) {
+          setOpenAiApiKeyInput("");
+        }
         setCloudOptIn(updated.cloudOptIn);
         setHistoryEnabled(updated.historyEnabled);
         setRetentionDays(updated.retentionDays);
-        setRuntimeMsg("Saved.");
+        if (updated.cloudOptIn && !updated.hasOpenAiApiKey) {
+          setRuntimeMsg("Saved. Add an OpenAI API key to use cloud fallback.");
+        } else {
+          setRuntimeMsg("Saved.");
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setRuntimeMsg(`Failed to save settings: ${msg}`);
       }
     },
-    [modelProfile, ortEp, languageHint, cloudOptIn, historyEnabled, retentionDays],
+    [
+      modelProfile,
+      performanceProfile,
+      toggleShortcut,
+      ortEp,
+      languageHint,
+      pillVisualizerSensitivity,
+      activitySensitivity,
+      activityNoiseGate,
+      activityClipThreshold,
+      inputGainBoost,
+      postUtteranceRefine,
+      phraseBiasTerms,
+      openAiApiKeyInput,
+      cloudOptIn,
+      historyEnabled,
+      retentionDays,
+    ],
   );
+
+  const collectRmsSamples = useCallback(async (durationMs: number): Promise<number[]> => {
+    const startedAt = performance.now();
+    const samples: number[] = [];
+    await new Promise<void>((resolve) => {
+      const timer = window.setInterval(() => {
+        samples.push(latestRmsRef.current);
+        if (performance.now() - startedAt >= durationMs) {
+          window.clearInterval(timer);
+          resolve();
+        }
+      }, 45);
+    });
+    return samples;
+  }, []);
+
+  const runMicCalibration = useCallback(async () => {
+    if (isCalibrating) return;
+    setIsCalibrating(true);
+    setCalibrationMsg("Ambient phase: stay silent...");
+    const startedByCalibration = !isListening;
+    try {
+      if (!isListening) {
+        await startEngine(selectedDeviceName);
+        await new Promise((r) => window.setTimeout(r, 450));
+      }
+      const ambient = await collectRmsSamples(2200);
+      setCalibrationMsg("Whisper phase: whisper naturally...");
+      await new Promise((r) => window.setTimeout(r, 250));
+      const whisper = await collectRmsSamples(2600);
+
+      const ambientP90 = percentile(ambient, 0.9);
+      const whisperP70 = percentile(whisper, 0.7);
+      const recommendedNoiseGate = clamp(ambientP90 * 1.45, 0.0004, 0.03);
+      const recommendedActivitySensitivity = clamp(
+        0.34 / Math.max(0.0001, whisperP70 - recommendedNoiseGate),
+        1.0,
+        20.0,
+      );
+      const recommendedPillSensitivity = clamp(recommendedActivitySensitivity * 1.12, 1.0, 20.0);
+      const recommendedInputGainBoost = clamp(0.02 / Math.max(0.0001, whisperP70), 0.5, 8.0);
+
+      setActivityNoiseGate(recommendedNoiseGate);
+      setActivitySensitivity(recommendedActivitySensitivity);
+      setActivityClipThreshold(clamp(Math.max(ambientP90 * 12, whisperP70 * 8), 0.12, 0.95));
+      setPillVisualizerSensitivity(recommendedPillSensitivity);
+      setInputGainBoost(recommendedInputGainBoost);
+
+      if (selectedDeviceName) {
+        try {
+          const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
+          const all = (raw ? JSON.parse(raw) : {}) as Record<string, MicCalibration>;
+          all[selectedDeviceName] = {
+            pillVisualizerSensitivity: recommendedPillSensitivity,
+            activitySensitivity: recommendedActivitySensitivity,
+            activityNoiseGate: recommendedNoiseGate,
+            activityClipThreshold: clamp(Math.max(ambientP90 * 12, whisperP70 * 8), 0.12, 0.95),
+            inputGainBoost: recommendedInputGainBoost,
+          };
+          localStorage.setItem(MIC_CALIBRATION_STORAGE_KEY, JSON.stringify(all));
+        } catch {
+          // Ignore local storage errors.
+        }
+      }
+
+      await applyRuntime({
+        pillVisualizerSensitivity: recommendedPillSensitivity,
+        activitySensitivity: recommendedActivitySensitivity,
+        activityNoiseGate: recommendedNoiseGate,
+        activityClipThreshold: clamp(Math.max(ambientP90 * 12, whisperP70 * 8), 0.12, 0.95),
+        inputGainBoost: recommendedInputGainBoost,
+      });
+      setCalibrationMsg("Calibration complete and applied.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setCalibrationMsg(`Calibration failed: ${msg}`);
+    } finally {
+      if (startedByCalibration) {
+        await stopEngine().catch(() => undefined);
+      }
+      setIsCalibrating(false);
+    }
+  }, [
+    isCalibrating,
+    isListening,
+    selectedDeviceName,
+    startEngine,
+    collectRmsSamples,
+    applyRuntime,
+    stopEngine,
+  ]);
 
   const refreshHistory = useCallback(async () => {
     const page = await getHistory(1, 100, historyQuery || null);
@@ -295,6 +545,9 @@ export default function Home() {
     status;
 
   const hasSegments = segments.length > 0;
+  const rmsMeterPercent = clamp(rawRms * 1600, 0, 1) * 100;
+  const noiseGatePercent = clamp(activityNoiseGate / 0.03, 0, 1) * 100;
+  const clipThresholdPercent = clamp(activityClipThreshold, 0, 1) * 100;
 
   return (
     <div className="app-layout">
@@ -573,39 +826,290 @@ export default function Home() {
           )}
 
           {tab === "settings" && (
-            <section className="panel">
-              <div className="panel-grid">
-                <label className="runtime-field">
-                  <span className="runtime-label">Model</span>
-                  <select className="runtime-select" value={modelProfile} onChange={(e) => setModelProfile(e.target.value)}>
-                    {MODEL_PROFILE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                  </select>
-                </label>
-                <label className="runtime-field">
-                  <span className="runtime-label">Runtime</span>
-                  <select className="runtime-select" value={ortEp} onChange={(e) => setOrtEp(e.target.value)}>
-                    {ORT_EP_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                  </select>
-                </label>
-                <label className="runtime-field">
-                  <span className="runtime-label">Language</span>
-                  <select className="runtime-select" value={languageHint} onChange={(e) => setLanguageHint(e.target.value)}>
-                    {LANGUAGE_HINT_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                  </select>
-                </label>
-                <label className="runtime-field">
-                  <span className="runtime-label">Retention (days)</span>
-                  <input className="runtime-select panel-input" type="number" min={1} max={3650} value={retentionDays} onChange={(e) => setRetentionDays(Number(e.target.value || 90))} />
-                </label>
+            <section className="settings-shell">
+              <header className="settings-hero">
+                <div className="settings-hero-copy">
+                  <span className="settings-kicker">Workspace</span>
+                  <h2>Runtime Settings</h2>
+                  <p>Tune recognition quality, latency, and voice behavior with live feedback.</p>
+                </div>
+                <div className="settings-hero-actions">
+                  <button className="action-btn" onClick={() => void runMicCalibration()} disabled={isCalibrating}>
+                    {isCalibrating ? "Calibrating..." : "Calibrate Mic"}
+                  </button>
+                  <button className="action-btn settings-save-btn" onClick={() => void applyRuntime()}>
+                    Save Settings
+                  </button>
+                </div>
+              </header>
+
+              <div className="settings-health-row">
+                <article className="settings-health-chip">
+                  <span>Active Mic</span>
+                  <strong>{selectedDeviceName ?? (loading ? "Detecting..." : "System Default")}</strong>
+                </article>
+                <article className="settings-health-chip">
+                  <span>Voice Activity</span>
+                  <strong>{isSpeech ? "Speech Detected" : "Listening for Speech"}</strong>
+                </article>
+                <article className="settings-health-chip">
+                  <span>Live RMS</span>
+                  <strong>{rawRms.toFixed(4)}</strong>
+                </article>
               </div>
-              <div className="panel-toolbar">
-                <label className="toggle"><input type="checkbox" checked={cloudOptIn} onChange={(e) => setCloudOptIn(e.target.checked)} />Cloud fallback (OpenAI)</label>
-                <label className="toggle"><input type="checkbox" checked={historyEnabled} onChange={(e) => setHistoryEnabled(e.target.checked)} />Save history</label>
-                <button className="action-btn" onClick={() => void applyRuntime()}>Save settings</button>
+
+              <article className="settings-card settings-card-full">
+                <div className="settings-card-header">
+                  <h3>Quick Profiles</h3>
+                  <p>Fast presets for common environments. You can fine-tune afterward.</p>
+                </div>
+                <div className="settings-preset-grid">
+                  <button
+                    className="settings-preset-btn"
+                    onClick={() => {
+                      setPerformanceProfile("latency_short_utterance");
+                      setPillVisualizerSensitivity(18);
+                      setActivitySensitivity(12);
+                      setActivityNoiseGate(0.0008);
+                      setActivityClipThreshold(0.28);
+                      setInputGainBoost(3.2);
+                    }}
+                  >
+                    <span>Whisper Catch</span>
+                    <small>Maximum pickup for quiet speech.</small>
+                  </button>
+                  <button
+                    className="settings-preset-btn"
+                    onClick={() => {
+                      setPerformanceProfile("balanced_general");
+                      setPillVisualizerSensitivity(12);
+                      setActivitySensitivity(7.5);
+                      setActivityNoiseGate(0.0015);
+                      setActivityClipThreshold(0.32);
+                      setInputGainBoost(1.8);
+                    }}
+                  >
+                    <span>Balanced</span>
+                    <small>Everyday dictation with stable detection.</small>
+                  </button>
+                  <button
+                    className="settings-preset-btn"
+                    onClick={() => {
+                      setPerformanceProfile("stability_long_form");
+                      setPillVisualizerSensitivity(9);
+                      setActivitySensitivity(5.2);
+                      setActivityNoiseGate(0.0028);
+                      setActivityClipThreshold(0.4);
+                      setInputGainBoost(1.1);
+                    }}
+                  >
+                    <span>Noisy Room</span>
+                    <small>More conservative gating for background noise.</small>
+                  </button>
+                </div>
+              </article>
+
+              <div className="settings-grid">
+                <article className="settings-card">
+                  <div className="settings-card-header">
+                    <h3>Core</h3>
+                    <p>Runtime model, language, and global controls.</p>
+                  </div>
+                  <div className="settings-fields">
+                    <label className="settings-field">
+                      <span>Model</span>
+                      <select className="settings-input" value={modelProfile} onChange={(e) => setModelProfile(e.target.value)}>
+                        {MODEL_PROFILE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Runtime</span>
+                      <select className="settings-input" value={ortEp} onChange={(e) => setOrtEp(e.target.value)}>
+                        {ORT_EP_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Performance Profile</span>
+                      <select className="settings-input" value={performanceProfile} onChange={(e) => setPerformanceProfile(e.target.value)}>
+                        {PERFORMANCE_PROFILE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Language</span>
+                      <select
+                        className="settings-input"
+                        value={languageHint}
+                        disabled={performanceProfile === "whisper_balanced_english"}
+                        onChange={(e) => setLanguageHint(e.target.value)}
+                      >
+                        {LANGUAGE_HINT_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Toggle Shortcut</span>
+                      <input
+                        className="settings-input"
+                        value={toggleShortcut}
+                        onChange={(e) => setToggleShortcut(e.target.value)}
+                        placeholder="Ctrl+Shift+Space"
+                      />
+                    </label>
+                    <div className="settings-field">
+                      <span>Shortcut Presets</span>
+                      <div className="settings-chip-row">
+                        <button className="settings-chip-btn" onClick={() => setToggleShortcut("Ctrl+Shift+Space")}>Ctrl+Shift+Space</button>
+                        <button className="settings-chip-btn" onClick={() => setToggleShortcut("Ctrl+Alt+Space")}>Ctrl+Alt+Space</button>
+                        <button className="settings-chip-btn" onClick={() => setToggleShortcut("Ctrl+Enter")}>Ctrl+Enter</button>
+                      </div>
+                    </div>
+                    <label className="settings-field">
+                      <span>Retention (days)</span>
+                      <input
+                        className="settings-input"
+                        type="number"
+                        min={1}
+                        max={3650}
+                        value={retentionDays}
+                        onChange={(e) => setRetentionDays(Number(e.target.value || 90))}
+                      />
+                    </label>
+                  </div>
+                </article>
+
+                <article className="settings-card">
+                  <div className="settings-card-header">
+                    <h3>Audio Intelligence</h3>
+                    <p>Sensitivity and gating controls with live metering.</p>
+                  </div>
+                  <div className="settings-meter-stack">
+                    <div className="settings-meter-row">
+                      <span>Input level</span>
+                      <div className="settings-meter">
+                        <div style={{ width: `${rmsMeterPercent}%` }} />
+                      </div>
+                    </div>
+                    <div className="settings-meter-row">
+                      <span>Noise gate</span>
+                      <div className="settings-meter is-gate">
+                        <div style={{ width: `${noiseGatePercent}%` }} />
+                      </div>
+                    </div>
+                    <div className="settings-meter-row">
+                      <span>Clip threshold</span>
+                      <div className="settings-meter is-clip">
+                        <div style={{ width: `${clipThresholdPercent}%` }} />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="settings-slider-group">
+                    <label className="settings-slider">
+                      <div>
+                        <span>Pill Sensitivity</span>
+                        <b>{pillVisualizerSensitivity.toFixed(1)}x</b>
+                      </div>
+                      <input type="range" min={1} max={20} step={0.1} value={pillVisualizerSensitivity} onChange={(e) => setPillVisualizerSensitivity(Number(e.target.value))} />
+                    </label>
+                    <label className="settings-slider">
+                      <div>
+                        <span>Activity Sensitivity</span>
+                        <b>{activitySensitivity.toFixed(1)}x</b>
+                      </div>
+                      <input type="range" min={1} max={20} step={0.1} value={activitySensitivity} onChange={(e) => setActivitySensitivity(Number(e.target.value))} />
+                    </label>
+                    <label className="settings-slider">
+                      <div>
+                        <span>Noise Gate</span>
+                        <b>{activityNoiseGate.toFixed(4)}</b>
+                      </div>
+                      <input type="range" min={0} max={0.1} step={0.0001} value={activityNoiseGate} onChange={(e) => setActivityNoiseGate(Number(e.target.value))} />
+                    </label>
+                    <label className="settings-slider">
+                      <div>
+                        <span>Clip Threshold</span>
+                        <b>{activityClipThreshold.toFixed(2)}</b>
+                      </div>
+                      <input type="range" min={0.02} max={1} step={0.01} value={activityClipThreshold} onChange={(e) => setActivityClipThreshold(Number(e.target.value))} />
+                    </label>
+                    <label className="settings-slider">
+                      <div>
+                        <span>Input Gain Boost</span>
+                        <b>{inputGainBoost.toFixed(1)}x</b>
+                      </div>
+                      <input type="range" min={0.5} max={8} step={0.1} value={inputGainBoost} onChange={(e) => setInputGainBoost(Number(e.target.value))} />
+                    </label>
+                  </div>
+                  <div className="settings-inline-stats">
+                    <span>Live RMS {rawRms.toFixed(4)}</span>
+                    <span>{isNoisy ? "Noisy environment" : "Noise stable"}</span>
+                    <span>{isClipping ? "Clipping risk" : "Headroom OK"}</span>
+                  </div>
+                </article>
+
+                <article className="settings-card">
+                  <div className="settings-card-header">
+                    <h3>Recognition</h3>
+                    <p>Bias and post-processing behavior for final transcript quality.</p>
+                  </div>
+                  <label className="settings-field">
+                    <span>Phrase Bias Terms</span>
+                    <textarea
+                      className="settings-input settings-textarea"
+                      value={phraseBiasTerms}
+                      onChange={(e) => setPhraseBiasTerms(e.target.value)}
+                      placeholder={"One term per line.\nLattice Labs\nDictum"}
+                      rows={5}
+                    />
+                  </label>
+                  <label className="settings-switch">
+                    <input type="checkbox" checked={postUtteranceRefine} onChange={(e) => setPostUtteranceRefine(e.target.checked)} />
+                    <span>Enable post-utterance refinement</span>
+                  </label>
+                </article>
+
+                <article className="settings-card">
+                  <div className="settings-card-header">
+                    <h3>Privacy</h3>
+                    <p>Control local retention and cloud fallback behavior.</p>
+                  </div>
+                  <label className="settings-field">
+                    <span>OpenAI API Key</span>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={openAiApiKeyInput}
+                      onChange={(e) => setOpenAiApiKeyInput(e.target.value)}
+                      placeholder={hasOpenAiApiKey ? "Saved locally. Enter new key to replace." : "sk-proj-..."}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <div className="settings-inline-actions">
+                    <button
+                      className="action-btn"
+                      disabled={!hasOpenAiApiKey}
+                      onClick={() => void applyRuntime({ openAiApiKey: "" })}
+                    >
+                      Clear Saved Key
+                    </button>
+                    <span className="settings-note">
+                      {hasOpenAiApiKey ? "API key saved locally for this profile." : "No API key saved yet."}
+                    </span>
+                  </div>
+                  <label className="settings-switch">
+                    <input type="checkbox" checked={cloudOptIn} onChange={(e) => setCloudOptIn(e.target.checked)} />
+                    <span>Cloud fallback (OpenAI)</span>
+                  </label>
+                  <label className="settings-switch">
+                    <input type="checkbox" checked={historyEnabled} onChange={(e) => setHistoryEnabled(e.target.checked)} />
+                    <span>Save local history</span>
+                  </label>
+                  <p className="settings-note">
+                    {runtimeMsg ?? "Cloud fallback requires an OpenAI API key."}
+                  </p>
+                  <p className="settings-note">
+                    {calibrationMsg ?? "Run mic calibration after changing devices or recording environment."}
+                  </p>
+                </article>
               </div>
-              <p className="runtime-hint">
-                {runtimeMsg ?? "Cloud fallback requires DICTUM_OPENAI_API_KEY in your environment."}
-              </p>
             </section>
           )}
         </div>

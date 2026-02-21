@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -66,6 +67,17 @@ impl Default for PipelineDiagnostics {
 }
 
 impl PipelineDiagnostics {
+    pub fn reset(&self) {
+        self.frames_in.store(0, Ordering::Relaxed);
+        self.frames_resampled.store(0, Ordering::Relaxed);
+        self.vad_windows.store(0, Ordering::Relaxed);
+        self.vad_speech.store(0, Ordering::Relaxed);
+        self.inference_calls.store(0, Ordering::Relaxed);
+        self.inference_errors.store(0, Ordering::Relaxed);
+        self.segments_emitted.store(0, Ordering::Relaxed);
+        self.fallback_emitted.store(0, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> DiagnosticsSnapshot {
         DiagnosticsSnapshot {
             frames_in: self.frames_in.load(Ordering::Relaxed),
@@ -114,8 +126,8 @@ pub struct PipelineContext {
 const DRAIN_CHUNK: usize = 960;
 
 /// Minimum sleep when the ring is empty (avoids busy-wait burning a core).
-const SLEEP_EMPTY_MS: u64 = 5;
-const EMPTY_FINAL_STREAK_FOR_FALLBACK: usize = 1;
+const DEFAULT_SLEEP_EMPTY_MS: u64 = 5;
+const EMPTY_FINAL_STREAK_FOR_FALLBACK: usize = 2;
 const FALLBACK_TEXT: &str = "[speech captured]";
 const STOP_FALLBACK_RMS_ACTIVITY_FACTOR: usize = 2; // min_speech_samples / 2
 const PARTIAL_MIN_INTERVAL_MS: u64 = 900;
@@ -186,7 +198,7 @@ pub fn run(mut ctx: PipelineContext) {
 
         if n == 0 {
             // Nothing to process — yield to avoid burning 100 % CPU
-            std::thread::sleep(std::time::Duration::from_millis(SLEEP_EMPTY_MS));
+            std::thread::sleep(std::time::Duration::from_millis(empty_sleep_ms()));
             continue;
         }
 
@@ -447,6 +459,17 @@ pub fn run(mut ctx: PipelineContext) {
     );
 }
 
+fn empty_sleep_ms() -> u64 {
+    static EMPTY_SLEEP_MS: OnceLock<u64> = OnceLock::new();
+    *EMPTY_SLEEP_MS.get_or_init(|| {
+        std::env::var("DICTUM_PIPELINE_EMPTY_SLEEP_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.clamp(1, 20))
+            .unwrap_or(DEFAULT_SLEEP_EMPTY_MS)
+    })
+}
+
 /// Run inference on `samples` and broadcast the result.
 enum FlushOutcome {
     Emitted,
@@ -616,16 +639,21 @@ fn apply_adaptive_input_gain(samples: &mut [f32], vad_threshold: f32) {
         return;
     }
     let rms = compute_rms(samples);
-    if rms <= 1e-6 {
+    if rms <= 3e-5 {
         return;
     }
     // Boost very quiet microphones/speakers toward a working speech band so
     // whisper-level input can still pass VAD and inference.
-    let target_rms = (vad_threshold * 4.0).clamp(0.02, 0.08);
+    let configured_boost = std::env::var("DICTUM_INPUT_GAIN_BOOST")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v.clamp(0.5, 8.0))
+        .unwrap_or(1.0);
+    let target_rms = (vad_threshold * 3.4 * configured_boost).clamp(0.012, 0.08);
     if rms >= target_rms {
         return;
     }
-    let gain = (target_rms / rms).clamp(1.0, 14.0);
+    let gain = (target_rms / rms).clamp(1.0, 9.0);
     if gain <= 1.03 {
         return;
     }

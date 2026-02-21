@@ -6,22 +6,41 @@ import { listenActivity } from "@/lib/tauri";
 interface UseActivityResult {
   level: number;
   isSpeech: boolean;
+  rawRms: number;
+  isNoisy: boolean;
+  isClipping: boolean;
+}
+
+interface UseActivityOptions {
+  sensitivity?: number;
+  noiseGate?: number;
+  clipThreshold?: number;
 }
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 
-export function useActivity(): UseActivityResult {
+export function useActivity(options?: UseActivityOptions): UseActivityResult {
+  const sensitivity = options?.sensitivity ?? 4.2;
+  const noiseGate = options?.noiseGate ?? 0.0015;
+  const clipThreshold = options?.clipThreshold ?? 0.32;
   const [level, setLevel] = useState(0);
   const [isSpeech, setIsSpeech] = useState(false);
+  const [rawRms, setRawRms] = useState(0);
+  const [isNoisy, setIsNoisy] = useState(false);
+  const [isClipping, setIsClipping] = useState(false);
   const lastSpeechTs = useRef(0);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
     listenActivity((event) => {
-      const nextLevel = clamp01(event.rms * 4.2);
+      const gated = Math.max(0, event.rms - noiseGate);
+      const nextLevel = clamp01(gated * sensitivity);
       setLevel((prev) => clamp01(Math.max(nextLevel, prev * 0.78)));
+      setRawRms(event.rms);
       setIsSpeech(event.isSpeech);
+      setIsNoisy(!event.isSpeech && event.rms > noiseGate * 1.2);
+      setIsClipping(event.rms >= clipThreshold);
       if (event.isSpeech) {
         lastSpeechTs.current = Date.now();
       }
@@ -36,7 +55,7 @@ export function useActivity(): UseActivityResult {
     return () => {
       unlisten?.();
     };
-  }, []);
+  }, [clipThreshold, noiseGate, sensitivity]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -49,5 +68,5 @@ export function useActivity(): UseActivityResult {
     return () => window.clearInterval(timer);
   }, []);
 
-  return { level, isSpeech };
+  return { level, isSpeech, rawRms, isNoisy, isClipping };
 }

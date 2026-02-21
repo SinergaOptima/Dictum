@@ -1,21 +1,26 @@
 import type { Metadata } from "next";
-import { Fraunces, Epilogue, Fira_Code } from "next/font/google";
+import { Instrument_Serif, Manrope, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const displayFont = Fraunces({
+const instrumentSerif = Instrument_Serif({
   subsets: ["latin"],
+  weight: "400",
+  style: ["normal", "italic"],
   variable: "--font-display",
-  axes: ["opsz"],
+  display: "swap",
 });
 
-const bodyFont = Epilogue({
+const manrope = Manrope({
   subsets: ["latin"],
   variable: "--font-body",
+  display: "swap",
 });
 
-const monoFont = Fira_Code({
+const jetbrains = JetBrains_Mono({
   subsets: ["latin"],
+  weight: ["400", "500"],
   variable: "--font-mono",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
@@ -29,9 +34,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="h-full">
+    <html lang="en" className="h-full" suppressHydrationWarning>
       <body
-        className={`${displayFont.variable} ${bodyFont.variable} ${monoFont.variable} h-full antialiased`}
+        className={`${instrumentSerif.variable} ${manrope.variable} ${jetbrains.variable} h-full antialiased`}
       >
         {children}
       </body>

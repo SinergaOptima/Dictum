@@ -1,0 +1,94 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dictum-ui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install UI dependencies
+        working-directory: dictum-ui
+        run: npm ci
+
+      - name: Build Tauri NSIS bundle
+        working-directory: dictum-app
+        run: cargo tauri build --bundles nsis
+
+      - name: Locate build artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path "target/release/dictum.exe"
+          $installer = Get-ChildItem "target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "NSIS installer not found."
+          }
+          "exe_path=$($exe.Path)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "installer_path=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Sign binaries (optional)
+        if: ${{ secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          $certPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+            Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) {
+            throw "signtool.exe not found on runner."
+          }
+          & $signtool.FullName sign /fd SHA256 /f $certPath /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.exe_path }}"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign dictum.exe" }
+          & $signtool.FullName sign /fd SHA256 /f $certPath /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.installer_path }}"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign installer" }
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          $exeHash = (Get-FileHash "${{ steps.artifacts.outputs.exe_path }}" -Algorithm SHA256).Hash
+          $installerHash = (Get-FileHash "${{ steps.artifacts.outputs.installer_path }}" -Algorithm SHA256).Hash
+          @(
+            "dictum.exe  $exeHash"
+            "$(Split-Path -Leaf '${{ steps.artifacts.outputs.installer_path }}')  $installerHash"
+          ) | Out-File -FilePath "target/release/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dictum-windows-release
+          path: |
+            ${{ steps.artifacts.outputs.exe_path }}
+            ${{ steps.artifacts.outputs.installer_path }}
+            target/release/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.artifacts.outputs.exe_path }}
+            ${{ steps.artifacts.outputs.installer_path }}
+            target/release/SHA256SUMS.txt
