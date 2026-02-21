@@ -414,6 +414,16 @@ body {
   padding: 4px 8px;
 }
 
+.runtime-select:is(select) {
+  color-scheme: dark;
+}
+
+.runtime-select:is(select) option,
+.runtime-select:is(select) optgroup {
+  color: rgb(var(--fg));
+  background: rgb(var(--card));
+}
+
 .panel-scroll {
   flex: 1;
   overflow-y: auto;
@@ -810,6 +820,16 @@ body {
   padding: 9px 10px;
   outline: none;
   transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.settings-input:is(select) {
+  color-scheme: dark;
+}
+
+.settings-input:is(select) option,
+.settings-input:is(select) optgroup {
+  color: rgb(var(--fg));
+  background: rgb(var(--card));
 }
 
 .settings-input:focus {

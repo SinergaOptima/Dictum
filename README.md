@@ -24,45 +24,25 @@ It combines:
 - `dictum-ui`: desktop UI and pill UI (Next.js)
 - `shared`: IPC TypeScript types shared by UI and app
 
-## Development
+## Roadmap
 
-Requirements:
-- Rust stable toolchain
-- Node.js 20+
-- npm
+### Near term
+- Improve low-volume recognition reliability and confidence handling.
+- Expand model profile support and tuning for high-end GPUs.
+- Continue UI refinement in settings and transcript quality feedback.
+- Harden release quality (signed artifacts, checksum visibility, rollback discipline).
 
-Run locally:
+### Mid term
+- Per-app dictation profiles (different behavior for IDE/chat/docs).
+- Advanced correction pipeline with phrase-level reprocessing on uncertain segments.
+- Better live quality indicators and optional post-utterance rewrite controls.
+- Richer snippet/dictionary management UX (search, import/export, team presets).
 
-```powershell
-cd dictum-app
-cargo tauri dev
-```
-
-## Windows packaging
-
-Build release exe + NSIS installer:
-
-```powershell
-cd dictum-app
-cargo tauri build --bundles nsis
-```
-
-Output artifacts:
-- `target/release/dictum.exe`
-- `target/release/bundle/nsis/*-setup.exe`
-
-## Cloud dictation key
-
-You can set the OpenAI API key directly in **Settings > Privacy**.
-Dictum stores whether a key exists and uses it for cloud fallback when enabled.
-
-## CI and release
-
-- CI: `.github/workflows/ci.yml`
-- Windows release workflow: `.github/workflows/release-windows.yml`
-
-For GitHub setup, pushing, and Windows code-signing secrets, see:
-- `docs/GITHUB_RELEASE.md`
+### Longer term
+- Pluggable inference backends and optional quantized model paths.
+- Multi-device profile sync with privacy-first defaults.
+- Opt-in telemetry bundle export for performance and recognition diagnostics.
+- Enterprise policy controls for cloud fallback, retention, and governance.
 
 ## Acknowledgment
 

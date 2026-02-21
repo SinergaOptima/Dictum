@@ -126,10 +126,16 @@ impl AppSettings {
 
 pub fn normalize_model_profile(raw: &str) -> String {
     let profile = raw.trim().to_ascii_lowercase();
-    if profile.is_empty() {
-        "large-v3-turbo".into()
-    } else {
-        profile
+    match profile.as_str() {
+        "" => "large-v3-turbo".into(),
+        "turbo" | "whisper-large-v3-turbo" => "large-v3-turbo".into(),
+        "large" | "whisper-large-v3" => "large-v3".into(),
+        "distil" | "distil-whisper-large-v3" => "distil-large-v3".into(),
+        "medium-en" => "medium.en".into(),
+        "small-en" => "small.en".into(),
+        "base-en" => "base.en".into(),
+        "tiny-en" => "tiny.en".into(),
+        _ => profile,
     }
 }
 
@@ -193,11 +199,7 @@ fn normalize_phrase_bias_terms(raw: &[String]) -> Vec<String> {
 
 pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
     if std::env::var("DICTUM_MODEL_PROFILE").is_err() {
-        if settings.model_profile.eq_ignore_ascii_case("small") {
-            std::env::remove_var("DICTUM_MODEL_PROFILE");
-        } else {
-            std::env::set_var("DICTUM_MODEL_PROFILE", &settings.model_profile);
-        }
+        std::env::set_var("DICTUM_MODEL_PROFILE", &settings.model_profile);
     }
 
     if std::env::var("DICTUM_ORT_EP").is_err() {

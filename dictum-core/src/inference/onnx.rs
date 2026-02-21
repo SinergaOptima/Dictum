@@ -170,14 +170,19 @@ fn selected_models_dir() -> PathBuf {
     }
     let default_dir = default_models_dir();
     if let Ok(profile) = std::env::var("DICTUM_MODEL_PROFILE") {
-        let profile = profile.trim();
-        if !profile.is_empty() && !profile.eq_ignore_ascii_case("small") {
-            let profile_dir = default_dir.join(profile);
+        let profile = profile.trim().to_ascii_lowercase();
+        if !profile.is_empty() {
+            let profile_dir = default_dir.join(&profile);
             if has_required_whisper_files(&profile_dir) {
                 return profile_dir;
             }
+            if profile == "small" && has_required_whisper_files(&default_dir) {
+                // Backward compatibility for installs where "small" model files
+                // are stored directly under the root models directory.
+                return default_dir;
+            }
             warn!(
-                profile,
+                profile = %profile,
                 profile_dir = ?profile_dir,
                 fallback_dir = ?default_dir,
                 "requested DICTUM_MODEL_PROFILE is missing required files; falling back to default models dir"

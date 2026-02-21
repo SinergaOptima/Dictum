@@ -43,11 +43,17 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const MODEL_PROFILE_OPTIONS = [
-  { value: "large-v3-turbo", label: "Large v3 Turbo (default)" },
-  { value: "small", label: "Small" },
+  { value: "large-v3-turbo", label: "Large v3 Turbo (default, fast + high quality)" },
+  { value: "distil-large-v3", label: "Distil Large v3 (fast, English-optimized)" },
+  { value: "large-v3", label: "Large v3 (max quality, heavier)" },
+  { value: "medium.en", label: "Medium English" },
+  { value: "medium", label: "Medium (multilingual)" },
   { value: "small.en", label: "Small English" },
+  { value: "small", label: "Small (multilingual)" },
   { value: "base.en", label: "Base English" },
+  { value: "base", label: "Base (multilingual)" },
   { value: "tiny.en", label: "Tiny English" },
+  { value: "tiny", label: "Tiny (multilingual, fastest)" },
 ];
 
 const ORT_EP_OPTIONS = [
