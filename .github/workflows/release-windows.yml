@@ -2,6 +2,20 @@ name: Windows Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "stable publishes as normal release; canary publishes as prerelease"
+        required: false
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - canary
+      publish_as_latest:
+        description: "mark release as latest (stable only)"
+        required: false
+        default: true
+        type: boolean
   push:
     tags:
       - "v*"
@@ -12,6 +26,9 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    concurrency:
+      group: release-windows-${{ github.ref }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -50,15 +67,30 @@ jobs:
           "exe_path=$($exe.Path)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "installer_path=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Sign binaries (optional)
+      - name: Resolve release metadata
+        id: release_meta
+        shell: pwsh
+        run: |
+          $channel = "stable"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ github.event.inputs.release_channel }}" -eq "canary") {
+            $channel = "canary"
+          }
+          "channel=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "prerelease=$([bool]($channel -eq 'canary'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Sign binaries (required)
+        id: sign_step
         shell: pwsh
         env:
           WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
-            Write-Host "Signing secrets not configured; skipping Authenticode signing."
-            exit 0
+            throw "Signing secrets are required. Set WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+            $env:WINDOWS_CERT_EXPECTED_SUBJECT = "Lattice Labs"
           }
           $certPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
@@ -73,6 +105,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to sign dictum.exe" }
           & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.installer_path }}"
           if ($LASTEXITCODE -ne 0) { throw "Failed to sign installer" }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+          $cert.Import($certPath, $env:WINDOWS_CERT_PASSWORD, "DefaultKeySet")
+          $subject = $cert.Subject
+          if ($subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+            throw "Signing certificate subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)'."
+          }
+          "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        env:
+          WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+            $env:WINDOWS_CERT_EXPECTED_SUBJECT = "Lattice Labs"
+          }
+          $files = @(
+            "${{ steps.artifacts.outputs.exe_path }}",
+            "${{ steps.artifacts.outputs.installer_path }}"
+          )
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne "Valid") {
+              throw "Authenticode signature invalid for $file (status=$($sig.Status))"
+            }
+            $subject = $sig.SignerCertificate.Subject
+            if ($subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+              throw "Signer subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)' for $file."
+            }
+          }
 
       - name: Generate SHA256 checksums
         shell: pwsh
@@ -84,6 +146,29 @@ jobs:
             "$(Split-Path -Leaf '${{ steps.artifacts.outputs.installer_path }}')  $installerHash"
           ) | Out-File -FilePath "target/release/SHA256SUMS.txt" -Encoding ascii
 
+      - name: Verify checksum file format
+        shell: pwsh
+        run: |
+          $lines = Get-Content "target/release/SHA256SUMS.txt"
+          if ($lines.Count -lt 2) { throw "SHA256SUMS.txt is missing required entries" }
+          foreach ($line in $lines) {
+            if ($line -notmatch "^[^ ]+\s+[A-Fa-f0-9]{64}$") {
+              throw "Malformed checksum line: $line"
+            }
+          }
+
+      - name: Write release manifest
+        shell: pwsh
+        run: |
+          $manifest = @{
+            tag = "${{ github.ref_name }}"
+            commit = "${{ github.sha }}"
+            channel = "${{ steps.release_meta.outputs.channel }}"
+            signed = "${{ steps.sign_step.outputs.signed }}"
+            generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+          } | ConvertTo-Json
+          $manifest | Out-File -FilePath "target/release/RELEASE_MANIFEST.json" -Encoding utf8
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -92,12 +177,16 @@ jobs:
             ${{ steps.artifacts.outputs.exe_path }}
             ${{ steps.artifacts.outputs.installer_path }}
             target/release/SHA256SUMS.txt
+            target/release/RELEASE_MANIFEST.json
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ steps.release_meta.outputs.prerelease }}
+          make_latest: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_as_latest == false && 'false' || 'true' }}
           files: |
             ${{ steps.artifacts.outputs.exe_path }}
             ${{ steps.artifacts.outputs.installer_path }}
             target/release/SHA256SUMS.txt
+            target/release/RELEASE_MANIFEST.json

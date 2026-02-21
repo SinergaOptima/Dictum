@@ -62,46 +62,94 @@ impl AudioCapture {
         use cpal::traits::HostTrait;
 
         let host = cpal::default_host();
-        let mut selected_device = None;
-
-        if let Some(preferred_name) = preferred_device_name {
-            match host.input_devices() {
-                Ok(mut devices) => {
-                    selected_device = devices.find(|device| {
-                        device
-                            .name()
-                            .map(|name| name == preferred_name)
-                            .unwrap_or(false)
-                    });
-
-                    if selected_device.is_none() {
-                        warn!(
-                            "preferred input device '{}' not found, falling back",
-                            preferred_name
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to list input devices while resolving preference: {e}");
-                }
-            }
+        let mut devices: Vec<(String, cpal::Device)> = host
+            .input_devices()
+            .map_err(|e| DictumError::AudioDevice(e.to_string()))?
+            .enumerate()
+            .map(|(idx, device)| {
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| format!("Input Device {}", idx + 1));
+                (name, device)
+            })
+            .collect();
+        if devices.is_empty() {
+            return Err(DictumError::NoDefaultInputDevice);
         }
 
-        let device = if let Some(device) = selected_device {
-            device
-        } else if let Some(default) = host.default_input_device() {
-            default
+        let default_name = host.default_input_device().and_then(|d| d.name().ok());
+        let preferred_idx = preferred_device_name.and_then(|preferred| {
+            devices
+                .iter()
+                .position(|(name, _)| name.as_str() == preferred)
+        });
+        let default_idx = default_name
+            .as_deref()
+            .and_then(|name| devices.iter().position(|(n, _)| n.as_str() == name));
+        let best_non_loopback_idx = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| !device::is_loopback_like_name(name))
+            .max_by_key(|(_, (name, _))| device::mic_preference_score(name))
+            .map(|(idx, _)| idx);
+
+        if preferred_device_name.is_some() && preferred_idx.is_none() {
+            warn!(
+                "preferred input device '{}' not found, falling back",
+                preferred_device_name.unwrap_or_default()
+            );
+        }
+
+        let selected_idx = if let Some(idx) = preferred_idx {
+            if device::is_loopback_like_name(&devices[idx].0) {
+                if let Some(safe_idx) = best_non_loopback_idx {
+                    if safe_idx != idx {
+                        warn!(
+                            preferred = devices[idx].0.as_str(),
+                            selected = devices[safe_idx].0.as_str(),
+                            "preferred device appears loopback-like; switching to recommended microphone input"
+                        );
+                        safe_idx
+                    } else {
+                        idx
+                    }
+                } else {
+                    idx
+                }
+            } else {
+                idx
+            }
+        } else if let Some(idx) = default_idx {
+            if device::is_loopback_like_name(&devices[idx].0) {
+                if let Some(safe_idx) = best_non_loopback_idx {
+                    if safe_idx != idx {
+                        warn!(
+                            default = devices[idx].0.as_str(),
+                            selected = devices[safe_idx].0.as_str(),
+                            "default input appears loopback-like; switching to recommended microphone input"
+                        );
+                        safe_idx
+                    } else {
+                        idx
+                    }
+                } else {
+                    idx
+                }
+            } else {
+                idx
+            }
+        } else if let Some(idx) = best_non_loopback_idx {
+            warn!("no default input device, falling back to best available microphone input");
+            idx
         } else {
-            let mut devices = host
-                .input_devices()
-                .map_err(|e| DictumError::AudioDevice(e.to_string()))?;
-            let fallback = devices.next().ok_or(DictumError::NoDefaultInputDevice)?;
-            warn!("no default input device, falling back to first available input");
-            fallback
+            warn!("no default microphone input device, falling back to first available input");
+            0
         };
 
+        let (selected_name, device) = devices.swap_remove(selected_idx);
+
         info!(
-            device = device.name().unwrap_or_default().as_str(),
+            device = selected_name.as_str(),
             "opening input device"
         );
 

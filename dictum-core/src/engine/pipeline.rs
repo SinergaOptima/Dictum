@@ -130,8 +130,8 @@ const DEFAULT_SLEEP_EMPTY_MS: u64 = 5;
 const EMPTY_FINAL_STREAK_FOR_FALLBACK: usize = 2;
 const FALLBACK_TEXT: &str = "[speech captured]";
 const STOP_FALLBACK_RMS_ACTIVITY_FACTOR: usize = 2; // min_speech_samples / 2
-const PARTIAL_MIN_INTERVAL_MS: u64 = 900;
-const PARTIAL_MIN_NEW_SAMPLES: usize = 12_000;
+const PARTIAL_MIN_INTERVAL_MS: u64 = 500;
+const PARTIAL_MIN_NEW_SAMPLES: usize = 8_000;
 const MAX_FLUSH_RETRY_TAIL_SECONDS: usize = 12;
 const MAX_FLUSH_CONTINUATION_OVERLAP_MS: usize = 1_600;
 

@@ -112,6 +112,10 @@ export interface DeviceInfo {
   name: string;
   /** Whether this is the system default input device. */
   isDefault: boolean;
+  /** Heuristic signal that device likely captures system/output audio. */
+  isLoopbackLike: boolean;
+  /** Heuristic recommendation for speech microphone capture. */
+  isRecommended: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +135,12 @@ export interface RuntimeSettings {
   toggleShortcut: string;
   /** ONNX execution provider preference: "auto" | "cpu" | "directml". */
   ortEp: string;
+  /** ONNX intra-op thread count (0 means auto). */
+  ortIntraThreads: number;
+  /** ONNX inter-op thread count (0 means auto). */
+  ortInterThreads: number;
+  /** ONNX parallel execution toggle. */
+  ortParallel: boolean;
   /** Decode hint: "auto" | "english" | "mandarin" | "russian". */
   languageHint: string;
   /** Pill visualizer sensitivity multiplier in [1, 20]. */
@@ -149,12 +159,83 @@ export interface RuntimeSettings {
   phraseBiasTerms: string[];
   /** Whether an OpenAI API key is stored locally. */
   hasOpenAiApiKey: boolean;
+  /** Cloud usage mode: local-only, hybrid fallback, or cloud preferred. */
+  cloudMode: "local_only" | "hybrid" | "cloud_preferred";
   /** Whether cloud fallback is enabled. */
   cloudOptIn: boolean;
+  /** Whether low-confidence local finals should be retried with reliability mode. */
+  reliabilityMode: boolean;
+  /** Whether first-run onboarding has been completed. */
+  onboardingCompleted: boolean;
   /** Whether transcript history is persisted. */
   historyEnabled: boolean;
   /** Retention horizon in days. */
   retentionDays: number;
+  /** Number of learned correction rules. */
+  correctionCount: number;
+}
+
+// ---------------------------------------------------------------------------
+// Model profile metadata + recommendation
+// ---------------------------------------------------------------------------
+
+export interface ModelProfileMetadata {
+  profile: string;
+  label: string;
+  speedTier: string;
+  qualityTier: string;
+  minRamGb: number;
+  minVramGb: number | null;
+  englishOptimized: boolean;
+  notes: string;
+}
+
+export interface ModelProfileRecommendation {
+  recommendedProfile: string;
+  suggestedOrtEp: "auto" | "directml" | "cpu" | string;
+  reason: string;
+  cpuThreads: number;
+  systemRamGb: number | null;
+  directmlAvailable: boolean;
+  availableProfiles: string[];
+}
+
+export interface AutoTuneResult {
+  runtimeSettings: RuntimeSettings;
+  summary: string;
+  cpuThreads: number;
+  ortIntraThreads: number;
+  ortInterThreads: number;
+  ortParallel: boolean;
+}
+
+export interface BenchmarkAutoTuneResult {
+  runtimeSettings: RuntimeSettings;
+  summary: string;
+  measuredFinalizeP95Ms: number;
+  measuredFallbackRatePct: number;
+}
+
+export interface AppUpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  repoSlug: string;
+  releaseName: string | null;
+  releaseNotes: string | null;
+  publishedAt: string | null;
+  htmlUrl: string;
+  assetName: string | null;
+  assetDownloadUrl: string | null;
+  checksumAssetName: string | null;
+  checksumAssetDownloadUrl: string | null;
+  expectedInstallerSha256: string | null;
+}
+
+export interface LearnedCorrection {
+  heard: string;
+  corrected: string;
+  hits: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +318,8 @@ export interface AppDiagnostics {
   injectSuccess: number;
   finalSegmentsSeen: number;
   fallbackStubTyped: number;
+  shortcutToggleExecuted: number;
+  shortcutToggleDropped: number;
   pipelineFramesIn: number;
   pipelineFramesResampled: number;
   pipelineVadWindows: number;

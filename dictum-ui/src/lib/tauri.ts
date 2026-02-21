@@ -7,6 +7,7 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getVersion as tauriGetVersion } from "@tauri-apps/api/app";
 import type {
   AudioActivityEvent,
   DictionaryEntry,
@@ -20,6 +21,12 @@ import type {
   SnippetEntry,
   StatsPayload,
   PerfSnapshot,
+  ModelProfileMetadata,
+  ModelProfileRecommendation,
+  AutoTuneResult,
+  BenchmarkAutoTuneResult,
+  AppUpdateInfo,
+  LearnedCorrection,
 } from "@shared/ipc_types";
 
 // ---------------------------------------------------------------------------
@@ -37,6 +44,9 @@ export const stopEngine = (): Promise<void> =>
 export const getStatus = (): Promise<EngineStatus> =>
   tauriInvoke("get_status");
 
+export const getAppVersion = (): Promise<string> =>
+  tauriGetVersion();
+
 export const listAudioDevices = (): Promise<DeviceInfo[]> =>
   tauriInvoke("list_audio_devices");
 
@@ -53,11 +63,60 @@ export const getPreferredInputDevice = (): Promise<string | null> =>
 export const getRuntimeSettings = (): Promise<RuntimeSettings> =>
   tauriInvoke("get_runtime_settings");
 
+export const getModelProfileCatalog = (): Promise<ModelProfileMetadata[]> =>
+  tauriInvoke("get_model_profile_catalog");
+
+export const getModelProfileRecommendation = (): Promise<ModelProfileRecommendation> =>
+  tauriInvoke("get_model_profile_recommendation");
+
+export const runAutoTune = (): Promise<AutoTuneResult> =>
+  tauriInvoke("run_auto_tune");
+
+export const runBenchmarkAutoTune = (
+  ambientP90: number,
+  whisperP70: number,
+  normalP80: number,
+  finalizeP95Ms: number,
+  fallbackRatePct: number,
+): Promise<BenchmarkAutoTuneResult> =>
+  tauriInvoke("run_benchmark_auto_tune", {
+    ambientP90,
+    whisperP70,
+    normalP80,
+    finalizeP95Ms,
+    fallbackRatePct,
+  });
+
+export const checkForAppUpdate = (
+  repoSlug?: string | null,
+): Promise<AppUpdateInfo> =>
+  tauriInvoke("check_for_app_update", {
+    repoSlug: repoSlug ?? null,
+  });
+
+export const downloadAndInstallAppUpdate = (
+  downloadUrl: string,
+  assetName?: string | null,
+  silentInstall?: boolean | null,
+  autoExit?: boolean | null,
+  expectedSha256?: string | null,
+): Promise<string> =>
+  tauriInvoke("download_and_install_app_update", {
+    downloadUrl,
+    assetName: assetName ?? null,
+    silentInstall: silentInstall ?? null,
+    autoExit: autoExit ?? null,
+    expectedSha256: expectedSha256 ?? null,
+  });
+
 export const setRuntimeSettings = (
   modelProfile?: string | null,
   performanceProfile?: string | null,
   toggleShortcut?: string | null,
   ortEp?: string | null,
+  ortIntraThreads?: number | null,
+  ortInterThreads?: number | null,
+  ortParallel?: boolean | null,
   languageHint?: string | null,
   pillVisualizerSensitivity?: number | null,
   activitySensitivity?: number | null,
@@ -67,7 +126,10 @@ export const setRuntimeSettings = (
   postUtteranceRefine?: boolean | null,
   phraseBiasTerms?: string[] | null,
   openAiApiKey?: string | null,
+  cloudMode?: string | null,
   cloudOptIn?: boolean | null,
+  reliabilityMode?: boolean | null,
+  onboardingCompleted?: boolean | null,
   historyEnabled?: boolean | null,
   retentionDays?: number | null,
 ): Promise<RuntimeSettings> =>
@@ -76,6 +138,9 @@ export const setRuntimeSettings = (
     performanceProfile: performanceProfile ?? null,
     toggleShortcut: toggleShortcut ?? null,
     ortEp: ortEp ?? null,
+    ortIntraThreads: ortIntraThreads ?? null,
+    ortInterThreads: ortInterThreads ?? null,
+    ortParallel: ortParallel ?? null,
     languageHint: languageHint ?? null,
     pillVisualizerSensitivity: pillVisualizerSensitivity ?? null,
     activitySensitivity: activitySensitivity ?? null,
@@ -85,7 +150,10 @@ export const setRuntimeSettings = (
     postUtteranceRefine: postUtteranceRefine ?? null,
     phraseBiasTerms: phraseBiasTerms ?? null,
     openAiApiKey: openAiApiKey ?? null,
+    cloudMode: cloudMode ?? null,
     cloudOptIn: cloudOptIn ?? null,
+    reliabilityMode: reliabilityMode ?? null,
+    onboardingCompleted: onboardingCompleted ?? null,
     historyEnabled: historyEnabled ?? null,
     retentionDays: retentionDays ?? null,
   });
@@ -151,6 +219,27 @@ export const upsertSnippet = (entry: SnippetEntry): Promise<SnippetEntry> =>
 
 export const deleteSnippet = (id: string): Promise<void> =>
   tauriInvoke("delete_snippet", { id });
+
+export const getLearnedCorrections = (): Promise<LearnedCorrection[]> =>
+  tauriInvoke("get_learned_corrections");
+
+export const learnCorrection = (
+  heard: string,
+  corrected: string,
+): Promise<LearnedCorrection[]> =>
+  tauriInvoke("learn_correction", {
+    heard,
+    corrected,
+  });
+
+export const deleteLearnedCorrection = (
+  heard: string,
+  corrected?: string | null,
+): Promise<LearnedCorrection[]> =>
+  tauriInvoke("delete_learned_correction", {
+    heard,
+    corrected: corrected ?? null,
+  });
 
 // ---------------------------------------------------------------------------
 // Event listeners

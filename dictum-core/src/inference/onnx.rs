@@ -86,16 +86,57 @@ fn decode_language_hint() -> DecodeLanguageHint {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudMode {
+    LocalOnly,
+    Hybrid,
+    CloudPreferred,
+}
+
+fn cloud_mode() -> CloudMode {
+    let mode = std::env::var("DICTUM_CLOUD_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "cloud_preferred" | "prefer_cloud" | "cloud" => CloudMode::CloudPreferred,
+        "hybrid" | "fallback" | "cloud_fallback" => CloudMode::Hybrid,
+        "local_only" | "off" | "disabled" => CloudMode::LocalOnly,
+        _ => {
+            let enabled = std::env::var("DICTUM_CLOUD_FALLBACK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if enabled {
+                CloudMode::Hybrid
+            } else {
+                CloudMode::LocalOnly
+            }
+        }
+    }
+}
+
 fn cloud_fallback_enabled() -> bool {
-    std::env::var("DICTUM_CLOUD_FALLBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    cloud_mode() != CloudMode::LocalOnly
 }
 
 fn post_utterance_refinement_enabled() -> bool {
     std::env::var("DICTUM_POST_UTTERANCE_REFINEMENT")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn reliability_mode_enabled() -> bool {
+    std::env::var("DICTUM_RELIABILITY_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn reliability_confidence_threshold() -> f32 {
+    std::env::var("DICTUM_RELIABILITY_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v.clamp(0.35, 0.95))
+        .unwrap_or(0.62)
 }
 
 fn phrase_bias_terms_from_env() -> Vec<String> {
@@ -1120,17 +1161,91 @@ impl SpeechModel for OnnxModel {
             text = best_refine_text;
         }
 
-        if text.is_empty() && !partial {
-            if let Some(fallback_text) =
-                openai_cloud_fallback_text(&chunk.samples, chunk.sample_rate)
-            {
-                let fallback_text = postprocess_transcript_text(&fallback_text);
-                if fallback_text.is_empty() {
-                    empty_reason = Some("cloud_fallback_empty_after_postprocess");
-                } else {
-                    text = fallback_text;
-                    empty_reason = None;
-                    info!("onnx empty decode recovered by OpenAI cloud fallback");
+        let mut local_confidence = if partial {
+            None
+        } else {
+            estimate_segment_confidence(&text, audio_seconds, false)
+        };
+
+        if !partial && reliability_mode_enabled() && !text.is_empty() {
+            let confidence_gate_failed =
+                local_confidence.unwrap_or(0.0) < reliability_confidence_threshold();
+            let quality_gate_failed = is_low_quality_transcript_text(&text, audio_seconds);
+            if confidence_gate_failed || quality_gate_failed {
+                let reliability_decode_steps = max_decode_steps
+                    .saturating_add(72)
+                    .clamp(MIN_FINAL_TOKENS, MAX_TOKENS);
+                let mut best_reliable_text = text.clone();
+                let mut best_reliable_score =
+                    transcript_quality_score(&best_reliable_text, audio_seconds);
+                for prefix in &decode_prefixes {
+                    let (candidate, _) = try_prefix(prefix, reliability_decode_steps)?;
+                    if let Some(candidate_text) = candidate {
+                        if is_low_quality_transcript_text(&candidate_text, audio_seconds) {
+                            continue;
+                        }
+                        let candidate_score =
+                            transcript_quality_score(&candidate_text, audio_seconds);
+                        if candidate_score > best_reliable_score + 0.45 {
+                            best_reliable_text = candidate_text;
+                            best_reliable_score = candidate_score;
+                        }
+                    }
+                }
+                if best_reliable_text != text {
+                    info!("reliability mode upgraded low-confidence transcript using re-decode");
+                }
+                text = best_reliable_text;
+                local_confidence = estimate_segment_confidence(&text, audio_seconds, false);
+            }
+        }
+
+        if !partial {
+            let active_cloud_mode = cloud_mode();
+            if active_cloud_mode != CloudMode::LocalOnly {
+                let confidence_gate_failed = local_confidence.unwrap_or(0.0) < 0.52;
+                let quality_gate_failed = text.is_empty()
+                    || is_low_quality_transcript_text(&text, audio_seconds)
+                    || confidence_gate_failed;
+                let should_try_cloud = match active_cloud_mode {
+                    CloudMode::Hybrid => quality_gate_failed,
+                    CloudMode::CloudPreferred => {
+                        text.is_empty() || quality_gate_failed || audio_seconds >= 2.8
+                    }
+                    CloudMode::LocalOnly => false,
+                };
+
+                if should_try_cloud {
+                    if let Some(cloud_text_raw) =
+                        openai_cloud_fallback_text(&chunk.samples, chunk.sample_rate)
+                    {
+                        let cloud_text = postprocess_transcript_text(&cloud_text_raw);
+                        if cloud_text.is_empty() {
+                            if text.is_empty() {
+                                empty_reason = Some("cloud_fallback_empty_after_postprocess");
+                            }
+                        } else if text.is_empty() {
+                            text = cloud_text;
+                            empty_reason = None;
+                            info!("onnx empty decode recovered by OpenAI cloud fallback");
+                        } else {
+                            let local_score = transcript_quality_score(&text, audio_seconds);
+                            let cloud_score = transcript_quality_score(&cloud_text, audio_seconds);
+                            let prefer_cloud = active_cloud_mode == CloudMode::CloudPreferred
+                                && cloud_score + 0.25 >= local_score;
+                            if cloud_score > local_score + 0.30 || prefer_cloud {
+                                text = cloud_text;
+                                info!(
+                                    local_score = format_args!("{local_score:.2}"),
+                                    cloud_score = format_args!("{cloud_score:.2}"),
+                                    "selected cloud transcript after quality gate evaluation"
+                                );
+                            }
+                        }
+                        local_confidence = estimate_segment_confidence(&text, audio_seconds, false);
+                    } else if text.is_empty() {
+                        empty_reason = Some("cloud_fallback_unavailable");
+                    }
                 }
             }
         }
@@ -1172,7 +1287,12 @@ impl SpeechModel for OnnxModel {
             id: self.utterance_count.to_string(),
             text: text.clone(),
             kind,
-            confidence: estimate_segment_confidence(&text, audio_seconds, partial),
+            confidence: if partial {
+                None
+            } else {
+                local_confidence
+                    .or_else(|| estimate_segment_confidence(&text, audio_seconds, false))
+            },
         }])
     }
 

@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LearnedCorrection {
+    pub heard: String,
+    pub corrected: String,
+    pub hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct AppSettings {
     pub preferred_input_device: Option<String>,
@@ -14,6 +22,9 @@ pub struct AppSettings {
     pub performance_profile: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
+    pub ort_intra_threads: usize,
+    pub ort_inter_threads: usize,
+    pub ort_parallel: bool,
     pub language_hint: String,
     pub pill_visualizer_sensitivity: f32,
     pub activity_sensitivity: f32,
@@ -23,19 +34,26 @@ pub struct AppSettings {
     pub post_utterance_refine: bool,
     pub phrase_bias_terms: Vec<String>,
     pub openai_api_key: Option<String>,
+    pub cloud_mode: String,
     pub cloud_opt_in: bool,
+    pub reliability_mode: bool,
+    pub onboarding_completed: bool,
     pub history_enabled: bool,
     pub retention_days: usize,
+    pub learned_corrections: Vec<LearnedCorrection>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             preferred_input_device: None,
-            model_profile: "large-v3-turbo".into(),
+            model_profile: "distil-large-v3".into(),
             performance_profile: "whisper_balanced_english".into(),
             toggle_shortcut: "Ctrl+Shift+Space".into(),
             ort_ep: "auto".into(),
+            ort_intra_threads: 0,
+            ort_inter_threads: 0,
+            ort_parallel: true,
             language_hint: "english".into(),
             pill_visualizer_sensitivity: 10.0,
             activity_sensitivity: 4.2,
@@ -45,9 +63,13 @@ impl Default for AppSettings {
             post_utterance_refine: false,
             phrase_bias_terms: Vec::new(),
             openai_api_key: None,
+            cloud_mode: "local_only".into(),
             cloud_opt_in: false,
+            reliability_mode: true,
+            onboarding_completed: false,
             history_enabled: true,
             retention_days: 90,
+            learned_corrections: Vec::new(),
         }
     }
 }
@@ -59,6 +81,9 @@ pub struct RuntimeSettings {
     pub performance_profile: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
+    pub ort_intra_threads: usize,
+    pub ort_inter_threads: usize,
+    pub ort_parallel: bool,
     pub language_hint: String,
     pub pill_visualizer_sensitivity: f32,
     pub activity_sensitivity: f32,
@@ -68,9 +93,13 @@ pub struct RuntimeSettings {
     pub post_utterance_refine: bool,
     pub phrase_bias_terms: Vec<String>,
     pub has_openai_api_key: bool,
+    pub cloud_mode: String,
     pub cloud_opt_in: bool,
+    pub reliability_mode: bool,
+    pub onboarding_completed: bool,
     pub history_enabled: bool,
     pub retention_days: usize,
+    pub correction_count: usize,
 }
 
 impl AppSettings {
@@ -79,6 +108,8 @@ impl AppSettings {
         self.performance_profile = normalize_performance_profile(&self.performance_profile);
         self.toggle_shortcut = normalize_toggle_shortcut(&self.toggle_shortcut);
         self.ort_ep = normalize_ort_ep(&self.ort_ep);
+        self.ort_intra_threads = self.ort_intra_threads.clamp(0, 32);
+        self.ort_inter_threads = self.ort_inter_threads.clamp(0, 8);
         self.language_hint = normalize_language_hint(&self.language_hint);
         self.pill_visualizer_sensitivity = self.pill_visualizer_sensitivity.clamp(1.0, 20.0);
         self.activity_sensitivity = self.activity_sensitivity.clamp(1.0, 20.0);
@@ -91,10 +122,24 @@ impl AppSettings {
             .as_ref()
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty());
+        let inferred_cloud_mode = if self.cloud_mode.trim().is_empty()
+            || (self.cloud_mode.trim().eq_ignore_ascii_case("local_only") && self.cloud_opt_in)
+        {
+            if self.cloud_opt_in {
+                "hybrid"
+            } else {
+                "local_only"
+            }
+        } else {
+            self.cloud_mode.as_str()
+        };
+        self.cloud_mode = normalize_cloud_mode(inferred_cloud_mode);
+        self.cloud_opt_in = self.cloud_mode != "local_only";
         if self.performance_profile == "whisper_balanced_english" {
             self.language_hint = "english".into();
         }
         self.retention_days = self.retention_days.clamp(1, 3650);
+        self.learned_corrections = normalize_learned_corrections(&self.learned_corrections);
         self.preferred_input_device = self
             .preferred_input_device
             .as_ref()
@@ -108,6 +153,9 @@ impl AppSettings {
             performance_profile: self.performance_profile.clone(),
             toggle_shortcut: self.toggle_shortcut.clone(),
             ort_ep: self.ort_ep.clone(),
+            ort_intra_threads: self.ort_intra_threads,
+            ort_inter_threads: self.ort_inter_threads,
+            ort_parallel: self.ort_parallel,
             language_hint: self.language_hint.clone(),
             pill_visualizer_sensitivity: self.pill_visualizer_sensitivity,
             activity_sensitivity: self.activity_sensitivity,
@@ -117,9 +165,13 @@ impl AppSettings {
             post_utterance_refine: self.post_utterance_refine,
             phrase_bias_terms: self.phrase_bias_terms.clone(),
             has_openai_api_key: self.openai_api_key.is_some(),
+            cloud_mode: self.cloud_mode.clone(),
             cloud_opt_in: self.cloud_opt_in,
+            reliability_mode: self.reliability_mode,
+            onboarding_completed: self.onboarding_completed,
             history_enabled: self.history_enabled,
             retention_days: self.retention_days,
+            correction_count: self.learned_corrections.len(),
         }
     }
 }
@@ -127,7 +179,7 @@ impl AppSettings {
 pub fn normalize_model_profile(raw: &str) -> String {
     let profile = raw.trim().to_ascii_lowercase();
     match profile.as_str() {
-        "" => "large-v3-turbo".into(),
+        "" => "distil-large-v3".into(),
         "turbo" | "whisper-large-v3-turbo" => "large-v3-turbo".into(),
         "large" | "whisper-large-v3" => "large-v3".into(),
         "distil" | "distil-whisper-large-v3" => "distil-large-v3".into(),
@@ -179,6 +231,14 @@ pub fn normalize_language_hint(raw: &str) -> String {
     }
 }
 
+pub fn normalize_cloud_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cloud" | "prefer_cloud" | "cloud_preferred" => "cloud_preferred".into(),
+        "hybrid" | "fallback" | "cloud_fallback" => "hybrid".into(),
+        _ => "local_only".into(),
+    }
+}
+
 fn normalize_phrase_bias_terms(raw: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for term in raw {
@@ -186,11 +246,39 @@ fn normalize_phrase_bias_terms(raw: &[String]) -> Vec<String> {
         if normalized.is_empty() {
             continue;
         }
-        if out.iter().any(|t: &String| t.eq_ignore_ascii_case(normalized)) {
+        if out
+            .iter()
+            .any(|t: &String| t.eq_ignore_ascii_case(normalized))
+        {
             continue;
         }
         out.push(normalized.to_string());
         if out.len() >= 64 {
+            break;
+        }
+    }
+    out
+}
+
+fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrection> {
+    let mut out = Vec::new();
+    for item in raw {
+        let heard = item.heard.trim().to_ascii_lowercase();
+        let corrected = item.corrected.trim().to_string();
+        if heard.is_empty() || corrected.is_empty() {
+            continue;
+        }
+        if out.iter().any(|e: &LearnedCorrection| {
+            e.heard.eq_ignore_ascii_case(&heard) && e.corrected.eq_ignore_ascii_case(&corrected)
+        }) {
+            continue;
+        }
+        out.push(LearnedCorrection {
+            heard,
+            corrected,
+            hits: item.hits.clamp(1, 1_000_000),
+        });
+        if out.len() >= 256 {
             break;
         }
     }
@@ -205,6 +293,22 @@ pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
     if std::env::var("DICTUM_ORT_EP").is_err() {
         std::env::set_var("DICTUM_ORT_EP", &settings.ort_ep);
     }
+    if std::env::var("DICTUM_ORT_INTRA_THREADS").is_err() {
+        if settings.ort_intra_threads > 0 {
+            std::env::set_var("DICTUM_ORT_INTRA_THREADS", settings.ort_intra_threads.to_string());
+        }
+    }
+    if std::env::var("DICTUM_ORT_INTER_THREADS").is_err() {
+        if settings.ort_inter_threads > 0 {
+            std::env::set_var("DICTUM_ORT_INTER_THREADS", settings.ort_inter_threads.to_string());
+        }
+    }
+    if std::env::var("DICTUM_ORT_PARALLEL").is_err() {
+        std::env::set_var(
+            "DICTUM_ORT_PARALLEL",
+            if settings.ort_parallel { "1" } else { "0" },
+        );
+    }
     if std::env::var("DICTUM_PERFORMANCE_PROFILE").is_err() {
         std::env::set_var("DICTUM_PERFORMANCE_PROFILE", &settings.performance_profile);
     }
@@ -214,8 +318,15 @@ pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
     if std::env::var("DICTUM_CLOUD_FALLBACK").is_err() {
         std::env::set_var(
             "DICTUM_CLOUD_FALLBACK",
-            if settings.cloud_opt_in { "1" } else { "0" },
+            if settings.cloud_mode == "local_only" {
+                "0"
+            } else {
+                "1"
+            },
         );
+    }
+    if std::env::var("DICTUM_CLOUD_MODE").is_err() {
+        std::env::set_var("DICTUM_CLOUD_MODE", &settings.cloud_mode);
     }
     if std::env::var("DICTUM_OPENAI_API_KEY").is_err() {
         if let Some(key) = settings.openai_api_key.as_ref() {
@@ -239,7 +350,16 @@ pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
         );
     }
     if std::env::var("DICTUM_PHRASE_BIAS_TERMS").is_err() {
-        std::env::set_var("DICTUM_PHRASE_BIAS_TERMS", settings.phrase_bias_terms.join("\n"));
+        std::env::set_var(
+            "DICTUM_PHRASE_BIAS_TERMS",
+            settings.phrase_bias_terms.join("\n"),
+        );
+    }
+    if std::env::var("DICTUM_RELIABILITY_MODE").is_err() {
+        std::env::set_var(
+            "DICTUM_RELIABILITY_MODE",
+            if settings.reliability_mode { "1" } else { "0" },
+        );
     }
 }
 

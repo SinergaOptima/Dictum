@@ -4,16 +4,16 @@
 //! by Tauri's `State<'_, AppState>` extractor.
 
 use dictum_core::DictumEngine;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, LearnedCorrection};
 use crate::storage::LocalStore;
 use crate::transform::TextTransform;
 
@@ -32,8 +32,16 @@ pub struct AppState {
     pub final_segments_seen: Arc<AtomicUsize>,
     /// Count of emitted fallback placeholders that were typed.
     pub fallback_stub_typed: Arc<AtomicUsize>,
+    /// Guard to prevent overlapping shortcut-triggered toggle operations.
+    pub shortcut_toggle_inflight: Arc<AtomicBool>,
+    /// Count of shortcut toggles accepted for execution.
+    pub shortcut_toggle_executed: Arc<AtomicUsize>,
+    /// Count of shortcut toggles dropped due to overlap/race protection.
+    pub shortcut_toggle_dropped: Arc<AtomicUsize>,
     /// Persisted app settings cache.
     pub settings: Arc<Mutex<AppSettings>>,
+    /// Learned transcript correction rules used for live cleanup.
+    pub learned_corrections: Arc<RwLock<Vec<LearnedCorrection>>>,
     /// Absolute path to `settings.json`.
     pub settings_path: PathBuf,
     /// Local encrypted SQLite storage.
@@ -52,6 +60,8 @@ impl AppState {
             inject_success: self.inject_success.load(Ordering::Relaxed),
             final_segments_seen: self.final_segments_seen.load(Ordering::Relaxed),
             fallback_stub_typed: self.fallback_stub_typed.load(Ordering::Relaxed),
+            shortcut_toggle_executed: self.shortcut_toggle_executed.load(Ordering::Relaxed),
+            shortcut_toggle_dropped: self.shortcut_toggle_dropped.load(Ordering::Relaxed),
             pipeline_frames_in: pipeline.frames_in,
             pipeline_frames_resampled: pipeline.frames_resampled,
             pipeline_vad_windows: pipeline.vad_windows,
@@ -82,6 +92,8 @@ pub struct AppDiagnostics {
     pub inject_success: usize,
     pub final_segments_seen: usize,
     pub fallback_stub_typed: usize,
+    pub shortcut_toggle_executed: usize,
+    pub shortcut_toggle_dropped: usize,
     pub pipeline_frames_in: usize,
     pub pipeline_frames_resampled: usize,
     pub pipeline_vad_windows: usize,
@@ -245,6 +257,8 @@ impl Serialize for AppDiagnostics {
             inject_success: usize,
             final_segments_seen: usize,
             fallback_stub_typed: usize,
+            shortcut_toggle_executed: usize,
+            shortcut_toggle_dropped: usize,
             pipeline_frames_in: usize,
             pipeline_frames_resampled: usize,
             pipeline_vad_windows: usize,
@@ -260,6 +274,8 @@ impl Serialize for AppDiagnostics {
             inject_success: self.inject_success,
             final_segments_seen: self.final_segments_seen,
             fallback_stub_typed: self.fallback_stub_typed,
+            shortcut_toggle_executed: self.shortcut_toggle_executed,
+            shortcut_toggle_dropped: self.shortcut_toggle_dropped,
             pipeline_frames_in: self.pipeline_frames_in,
             pipeline_frames_resampled: self.pipeline_frames_resampled,
             pipeline_vad_windows: self.pipeline_vad_windows,

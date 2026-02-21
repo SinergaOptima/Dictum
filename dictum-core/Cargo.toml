@@ -24,6 +24,7 @@ ndarray    = { workspace = true, optional = true }
 rustfft    = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 reqwest    = { workspace = true, optional = true }
+hound = { workspace = true }
 
 # Lock-free ring buffer
 ringbuf = { workspace = true }

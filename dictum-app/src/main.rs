@@ -12,6 +12,7 @@
 )]
 
 mod commands;
+mod model_profiles;
 mod settings;
 mod state;
 mod storage;
@@ -19,7 +20,7 @@ mod text_injector;
 mod transform;
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -57,7 +58,10 @@ fn enforce_single_instance() -> Option<isize> {
     };
 
     fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     let mutex_name = to_wide("Global\\DictumSingleInstance");
@@ -89,7 +93,7 @@ fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
             config.min_speech_samples = 460;
             config.max_speech_samples = 96_000;
             config.vad_hangover_frames = 7;
-            config.enable_partial_inference = false;
+            config.enable_partial_inference = true;
             config.silero_vad_threshold = 0.045;
         }
         "latency_short_utterance" => {
@@ -105,7 +109,7 @@ fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
             config.min_speech_samples = 600;
             config.max_speech_samples = 88_000;
             config.vad_hangover_frames = 4;
-            config.enable_partial_inference = false;
+            config.enable_partial_inference = true;
             config.silero_vad_threshold = 0.058;
         }
         _ => {
@@ -114,7 +118,7 @@ fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
             config.min_speech_samples = 520;
             config.max_speech_samples = 104_000;
             config.vad_hangover_frames = 6;
-            config.enable_partial_inference = false;
+            config.enable_partial_inference = true;
             config.silero_vad_threshold = 0.052;
         }
     }
@@ -122,8 +126,23 @@ fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
 
 fn toggle_engine_from_shortcut<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<AppState>();
+    let toggle_inflight = Arc::clone(&state.shortcut_toggle_inflight);
+    if toggle_inflight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        state
+            .shortcut_toggle_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("shortcut toggle dropped due to in-flight operation");
+        return;
+    }
+    state
+        .shortcut_toggle_executed
+        .fetch_add(1, Ordering::Relaxed);
     let engine = Arc::clone(&state.engine);
     let preferred_device = state.preferred_input_device.lock().clone();
+    let toggle_inflight_for_task = Arc::clone(&toggle_inflight);
     tauri::async_runtime::spawn_blocking(move || {
         let should_start = !matches!(
             engine.status(),
@@ -139,6 +158,7 @@ fn toggle_engine_from_shortcut<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         if let Err(e) = result {
             tracing::warn!("global shortcut toggle failed: {e}");
         }
+        toggle_inflight_for_task.store(false, Ordering::SeqCst);
     });
 }
 
@@ -250,6 +270,95 @@ fn is_duplicate_transcript(
     }
 }
 
+fn apply_learned_corrections(
+    text: &str,
+    corrections: &[settings::LearnedCorrection],
+) -> (String, bool) {
+    let mut out = text.trim().to_string();
+    if out.is_empty() || corrections.is_empty() {
+        return (out, false);
+    }
+    let mut applied = false;
+    for correction in corrections {
+        let heard = correction.heard.trim();
+        let corrected = correction.corrected.trim();
+        if heard.is_empty() || corrected.is_empty() {
+            continue;
+        }
+        let replaced = replace_word_case_aware_local(&out, heard, corrected);
+        if replaced != out {
+            applied = true;
+            out = replaced;
+        }
+    }
+    (out, applied)
+}
+
+fn replace_word_case_aware_local(text: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < chars.len() {
+        let rem: String = chars[i..].iter().collect();
+        if rem.to_ascii_lowercase().starts_with(&needle_lower) {
+            let start_ok = if i == 0 {
+                true
+            } else {
+                !is_word_char_local(chars[i - 1])
+            };
+            let end_idx = i + needle.chars().count();
+            let end_ok = if end_idx >= chars.len() {
+                true
+            } else {
+                !is_word_char_local(chars[end_idx])
+            };
+            if start_ok && end_ok {
+                let source_slice: String = chars[i..end_idx].iter().collect();
+                out.push_str(match_case_local(&source_slice, replacement).as_str());
+                i = end_idx;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    if changed {
+        out
+    } else {
+        text.to_string()
+    }
+}
+
+fn is_word_char_local(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '\''
+}
+
+fn match_case_local(source: &str, replacement: &str) -> String {
+    if source.chars().all(|c| c.is_uppercase()) {
+        replacement.to_ascii_uppercase()
+    } else if source
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
+        let mut chars = replacement.chars();
+        if let Some(first) = chars.next() {
+            format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+        } else {
+            replacement.to_string()
+        }
+    } else {
+        replacement.to_string()
+    }
+}
+
 fn main() {
     // ── Tracing ───────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
@@ -331,13 +440,11 @@ fn main() {
     let toggle_debounce = Arc::new(Mutex::new(None::<Instant>));
     let toggle_debounce_for_handler = Arc::clone(&toggle_debounce);
     let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(
-            if app_settings.toggle_shortcut.trim().is_empty() {
-                DEFAULT_GLOBAL_TOGGLE_SHORTCUT
-            } else {
-                app_settings.toggle_shortcut.as_str()
-            },
-        )
+        .with_shortcut(if app_settings.toggle_shortcut.trim().is_empty() {
+            DEFAULT_GLOBAL_TOGGLE_SHORTCUT
+        } else {
+            app_settings.toggle_shortcut.as_str()
+        })
         .expect("invalid global shortcut")
         .with_handler(move |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
@@ -362,6 +469,9 @@ fn main() {
     let inject_success = Arc::new(AtomicUsize::new(0));
     let final_segments_seen = Arc::new(AtomicUsize::new(0));
     let fallback_stub_typed = Arc::new(AtomicUsize::new(0));
+    let shortcut_toggle_inflight = Arc::new(AtomicBool::new(false));
+    let shortcut_toggle_executed = Arc::new(AtomicUsize::new(0));
+    let shortcut_toggle_dropped = Arc::new(AtomicUsize::new(0));
     let inject_calls_for_setup = Arc::clone(&inject_calls);
     let inject_success_for_setup = Arc::clone(&inject_success);
     let final_segments_seen_for_setup = Arc::clone(&final_segments_seen);
@@ -369,6 +479,10 @@ fn main() {
     let store_for_setup = Arc::clone(&store);
     let transformer_for_setup = Arc::clone(&transformer);
     let settings_for_setup = Arc::clone(&settings_state);
+    let learned_corrections_for_setup = Arc::new(parking_lot::RwLock::new(
+        app_settings.learned_corrections.clone(),
+    ));
+    let learned_corrections_for_loop = Arc::clone(&learned_corrections_for_setup);
     let perf_metrics = Arc::new(Mutex::new(PerfMetrics::default()));
     let perf_metrics_for_setup = Arc::clone(&perf_metrics);
 
@@ -390,6 +504,7 @@ fn main() {
             let store_clone = Arc::clone(&store_for_setup);
             let transformer_clone = Arc::clone(&transformer_for_setup);
             let settings_clone = Arc::clone(&settings_for_setup);
+            let learned_corrections_clone = Arc::clone(&learned_corrections_for_loop);
             let perf_metrics_clone = Arc::clone(&perf_metrics_for_setup);
             let mut last_injected_text: Option<(String, Instant)> = None;
             let mut last_partial_text: Option<(String, Instant)> = None;
@@ -413,18 +528,23 @@ fn main() {
                             let mut final_text_parts = Vec::new();
                             let mut dictionary_applied = false;
                             let mut snippet_applied = false;
+                            let corrections_snapshot = learned_corrections_clone.read().clone();
                             let transform_started = Instant::now();
                             for segment in event
                                 .segments
                                 .iter_mut()
                                 .filter(|segment| segment.kind == SegmentKind::Final)
                             {
-                                let transformed = transformer_clone.apply(segment.text.trim());
+                                let (corrected_text, correction_applied) = apply_learned_corrections(
+                                    segment.text.trim(),
+                                    &corrections_snapshot,
+                                );
+                                let transformed = transformer_clone.apply(corrected_text.trim());
                                 if !transformed.text.is_empty() {
                                     segment.text = transformed.text.clone();
                                     final_text_parts.push(transformed.text);
                                 }
-                                dictionary_applied |= transformed.dictionary_applied;
+                                dictionary_applied |= transformed.dictionary_applied || correction_applied;
                                 snippet_applied |= transformed.snippet_applied;
                             }
                             let transform_elapsed_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
@@ -609,7 +729,11 @@ fn main() {
             inject_success,
             final_segments_seen,
             fallback_stub_typed,
+            shortcut_toggle_inflight,
+            shortcut_toggle_executed,
+            shortcut_toggle_dropped,
             settings: Arc::clone(&settings_state),
+            learned_corrections: Arc::clone(&learned_corrections_for_setup),
             settings_path,
             store,
             transformer,
@@ -623,7 +747,16 @@ fn main() {
             commands::set_preferred_input_device,
             commands::get_preferred_input_device,
             commands::get_runtime_settings,
+            commands::get_model_profile_catalog,
+            commands::get_model_profile_recommendation,
+            commands::check_for_app_update,
+            commands::download_and_install_app_update,
+            commands::run_auto_tune,
+            commands::run_benchmark_auto_tune,
             commands::set_runtime_settings,
+            commands::get_learned_corrections,
+            commands::learn_correction,
+            commands::delete_learned_correction,
             commands::get_perf_snapshot,
             commands::get_privacy_settings,
             commands::set_privacy_settings,

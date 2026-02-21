@@ -7,6 +7,7 @@ import type { DeviceInfo } from "@shared/ipc_types";
 interface UseAudioDevicesResult {
   devices: DeviceInfo[];
   defaultDevice: DeviceInfo | null;
+  recommendedDevice: DeviceInfo | null;
   loading: boolean;
   error: string | null;
   refreshDevices: () => Promise<void>;
@@ -38,6 +39,7 @@ export function useAudioDevices(): UseAudioDevicesResult {
   return {
     devices,
     defaultDevice: devices.find((d) => d.isDefault) ?? null,
+    recommendedDevice: devices.find((d) => d.isRecommended) ?? null,
     loading,
     error,
     refreshDevices,
