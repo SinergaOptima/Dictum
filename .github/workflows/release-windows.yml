@@ -105,8 +105,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to sign dictum.exe" }
           & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.installer_path }}"
           if ($LASTEXITCODE -ne 0) { throw "Failed to sign installer" }
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-          $cert.Import($certPath, $env:WINDOWS_CERT_PASSWORD, "DefaultKeySet")
+          $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
+          $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath, $env:WINDOWS_CERT_PASSWORD, $flags)
           $subject = $cert.Subject
           if ($subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
             throw "Signing certificate subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)'."
