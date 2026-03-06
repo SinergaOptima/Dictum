@@ -89,9 +89,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
             throw "Signing secrets are required. Set WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD."
           }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
-            $env:WINDOWS_CERT_EXPECTED_SUBJECT = "Lattice Labs"
-          }
           $certPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
@@ -108,7 +105,7 @@ jobs:
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
           $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath, $env:WINDOWS_CERT_PASSWORD, $flags)
           $subject = $cert.Subject
-          if ($subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
             throw "Signing certificate subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)'."
           }
           "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -118,9 +115,6 @@ jobs:
         env:
           WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
-            $env:WINDOWS_CERT_EXPECTED_SUBJECT = "Lattice Labs"
-          }
           $files = @(
             "${{ steps.artifacts.outputs.exe_path }}",
             "${{ steps.artifacts.outputs.installer_path }}"
@@ -131,7 +125,7 @@ jobs:
               throw "Authenticode signature invalid for $file (status=$($sig.Status))"
             }
             $subject = $sig.SignerCertificate.Subject
-            if ($subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
+            if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
               throw "Signer subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)' for $file."
             }
           }
