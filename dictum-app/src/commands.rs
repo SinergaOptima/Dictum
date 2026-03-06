@@ -22,7 +22,8 @@ use crate::settings::{
 use crate::state::{AppState, PerfSnapshot};
 use crate::storage::{DictionaryEntry, HistoryPage, PrivacySettings, SnippetEntry, StatsPayload};
 
-const DEFAULT_UPDATE_REPO_SLUG: &str = "latticelabs/dictum";
+const DEFAULT_UPDATE_REPO_SLUG: &str = "sinergaoptima/dictum";
+const LEGACY_UPDATE_REPO_SLUGS: &[&str] = &["latticelabs/dictum"];
 const UPDATE_TIMEOUT_SECS: u64 = 45;
 
 fn runtime_engine_config(performance_profile: &str) -> EngineConfig {
@@ -91,7 +92,15 @@ fn normalize_repo_slug(input: Option<String>) -> Result<String, String> {
     let chosen = input
         .or_else(|| std::env::var("DICTUM_UPDATE_REPO").ok())
         .unwrap_or_else(|| DEFAULT_UPDATE_REPO_SLUG.to_string());
-    let slug = chosen.trim().trim_matches('/').to_ascii_lowercase();
+    let raw_slug = chosen.trim().trim_matches('/').to_ascii_lowercase();
+    let slug = if LEGACY_UPDATE_REPO_SLUGS
+        .iter()
+        .any(|legacy| raw_slug.eq_ignore_ascii_case(legacy))
+    {
+        DEFAULT_UPDATE_REPO_SLUG.to_string()
+    } else {
+        raw_slug
+    };
     if slug.is_empty() {
         return Err("Update repository cannot be empty.".into());
     }

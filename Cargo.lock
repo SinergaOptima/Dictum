@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "dictum-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "dictum-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "approx",

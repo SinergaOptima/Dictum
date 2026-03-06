@@ -130,7 +130,8 @@ const CLOUD_MODE_OPTIONS: Array<{ value: CloudMode; label: string; hint: string 
 
 const MIC_CALIBRATION_STORAGE_KEY = "dictum-mic-calibration-v1";
 const UPDATE_REPO_STORAGE_KEY = "dictum-update-repo-v1";
-const DEFAULT_UPDATE_REPO = "latticelabs/dictum";
+const DEFAULT_UPDATE_REPO = "sinergaoptima/dictum";
+const LEGACY_UPDATE_REPOS = new Set(["latticelabs/dictum"]);
 const UPDATE_AUTO_CHECK_STORAGE_KEY = "dictum-update-auto-check-v1";
 const UPDATE_SKIP_VERSION_STORAGE_KEY = "dictum-update-skip-version-v1";
 const UPDATE_REMIND_UNTIL_STORAGE_KEY = "dictum-update-remind-until-v1";
@@ -373,7 +374,10 @@ export default function Home() {
     try {
       const savedRepo = localStorage.getItem(UPDATE_REPO_STORAGE_KEY);
       if (savedRepo && savedRepo.trim()) {
-        setUpdateRepoSlug(savedRepo.trim());
+        const normalizedRepo = savedRepo.trim().toLowerCase();
+        setUpdateRepoSlug(
+          LEGACY_UPDATE_REPOS.has(normalizedRepo) ? DEFAULT_UPDATE_REPO : savedRepo.trim(),
+        );
       }
       const savedAutoCheck = localStorage.getItem(UPDATE_AUTO_CHECK_STORAGE_KEY);
       if (savedAutoCheck === "0") {
