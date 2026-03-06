@@ -148,10 +148,7 @@ impl AudioCapture {
 
         let (selected_name, device) = devices.swap_remove(selected_idx);
 
-        info!(
-            device = selected_name.as_str(),
-            "opening input device"
-        );
+        info!(device = selected_name.as_str(), "opening input device");
 
         let supported = device
             .default_input_config()

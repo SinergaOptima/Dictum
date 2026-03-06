@@ -26,7 +26,7 @@ use std::sync::{
     Arc,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -97,7 +97,7 @@ impl Default for EngineConfig {
 /// Wrap in `Arc<DictumEngine>` to share between the Tauri app state and
 /// event-forwarding async tasks.
 pub struct DictumEngine {
-    config: EngineConfig,
+    config: Arc<RwLock<EngineConfig>>,
     model: ModelHandle,
     /// `true` while capture + pipeline are active.
     running: Arc<AtomicBool>,
@@ -124,7 +124,7 @@ impl DictumEngine {
         let diagnostics = Arc::new(pipeline::PipelineDiagnostics::default());
 
         Self {
-            config,
+            config: Arc::new(RwLock::new(config)),
             model,
             running: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(EngineStatus::Idle)),
@@ -175,7 +175,7 @@ impl DictumEngine {
         let (producer, consumer) = create_audio_ring();
 
         // Clone all Arc-wrapped state before moving into the closure.
-        let config = self.config.clone();
+        let config = self.config.read().clone();
         let model = self.model.clone();
         let running = Arc::clone(&self.running);
         let transcript_tx = self.transcript_tx.clone();
@@ -302,6 +302,14 @@ impl DictumEngine {
     /// Current engine status (snapshot).
     pub fn status(&self) -> EngineStatus {
         *self.status.lock()
+    }
+
+    /// Update the config used for future `start()` calls.
+    ///
+    /// This does not mutate an already-running pipeline; it applies on the next
+    /// listen session.
+    pub fn update_config(&self, config: EngineConfig) {
+        *self.config.write() = config;
     }
 
     /// Subscribe to live transcript events.

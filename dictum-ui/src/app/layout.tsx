@@ -1,16 +1,15 @@
 import type { Metadata } from "next";
-import { Instrument_Serif, Manrope, JetBrains_Mono } from "next/font/google";
+import { Newsreader, Outfit, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const instrumentSerif = Instrument_Serif({
+const newsreader = Newsreader({
   subsets: ["latin"],
-  weight: "400",
   style: ["normal", "italic"],
   variable: "--font-display",
   display: "swap",
 });
 
-const manrope = Manrope({
+const outfit = Outfit({
   subsets: ["latin"],
   variable: "--font-body",
   display: "swap",
@@ -36,7 +35,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full" suppressHydrationWarning>
       <body
-        className={`${instrumentSerif.variable} ${manrope.variable} ${jetbrains.variable} h-full antialiased`}
+        className={`${newsreader.variable} ${outfit.variable} ${jetbrains.variable} h-full antialiased`}
       >
         {children}
       </body>

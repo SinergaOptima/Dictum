@@ -100,11 +100,9 @@ pub fn list_input_devices() -> Vec<DeviceInfo> {
                 })
                 .collect::<Vec<_>>();
 
-            if let Some((idx, _)) = list
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, d)| mic_preference_score(&d.name) + if d.is_default { 2 } else { 0 })
-            {
+            if let Some((idx, _)) = list.iter().enumerate().max_by_key(|(_, d)| {
+                mic_preference_score(&d.name) + if d.is_default { 2 } else { 0 }
+            }) {
                 if let Some(best) = list.get_mut(idx) {
                     best.is_recommended = true;
                 }
@@ -153,7 +151,9 @@ mod tests {
     fn detects_common_loopback_names() {
         assert!(is_loopback_like_name("Stereo Mix (Realtek Audio)"));
         assert!(is_loopback_like_name("What U Hear (Sound Blaster)"));
-        assert!(is_loopback_like_name("Speakers (High Definition Audio Device)"));
+        assert!(is_loopback_like_name(
+            "Speakers (High Definition Audio Device)"
+        ));
     }
 
     #[test]

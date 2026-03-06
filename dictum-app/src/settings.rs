@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use dictum_core::engine::EngineConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +177,45 @@ impl AppSettings {
     }
 }
 
+pub fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
+    match profile {
+        "whisper_balanced_english" => {
+            // Higher whisper sensitivity while keeping enough hangover for quiet tails.
+            config.vad_threshold = 0.00125;
+            config.min_speech_samples = 460;
+            config.max_speech_samples = 96_000;
+            config.vad_hangover_frames = 7;
+            config.enable_partial_inference = true;
+            config.silero_vad_threshold = 0.045;
+        }
+        "latency_short_utterance" => {
+            config.vad_threshold = 0.00195;
+            config.min_speech_samples = 420;
+            config.max_speech_samples = 72_000;
+            config.vad_hangover_frames = 3;
+            config.enable_partial_inference = true;
+            config.silero_vad_threshold = 0.065;
+        }
+        "balanced_general" => {
+            config.vad_threshold = 0.0017;
+            config.min_speech_samples = 600;
+            config.max_speech_samples = 88_000;
+            config.vad_hangover_frames = 4;
+            config.enable_partial_inference = true;
+            config.silero_vad_threshold = 0.058;
+        }
+        _ => {
+            // stability_long_form (default)
+            config.vad_threshold = 0.00145;
+            config.min_speech_samples = 520;
+            config.max_speech_samples = 104_000;
+            config.vad_hangover_frames = 6;
+            config.enable_partial_inference = true;
+            config.silero_vad_threshold = 0.052;
+        }
+    }
+}
+
 pub fn normalize_model_profile(raw: &str) -> String {
     let profile = raw.trim().to_ascii_lowercase();
     match profile.as_str() {
@@ -295,12 +335,18 @@ pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
     }
     if std::env::var("DICTUM_ORT_INTRA_THREADS").is_err() {
         if settings.ort_intra_threads > 0 {
-            std::env::set_var("DICTUM_ORT_INTRA_THREADS", settings.ort_intra_threads.to_string());
+            std::env::set_var(
+                "DICTUM_ORT_INTRA_THREADS",
+                settings.ort_intra_threads.to_string(),
+            );
         }
     }
     if std::env::var("DICTUM_ORT_INTER_THREADS").is_err() {
         if settings.ort_inter_threads > 0 {
-            std::env::set_var("DICTUM_ORT_INTER_THREADS", settings.ort_inter_threads.to_string());
+            std::env::set_var(
+                "DICTUM_ORT_INTER_THREADS",
+                settings.ort_inter_threads.to_string(),
+            );
         }
     }
     if std::env::var("DICTUM_ORT_PARALLEL").is_err() {

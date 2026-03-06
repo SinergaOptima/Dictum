@@ -124,7 +124,10 @@ impl RateConverter {
         }
 
         // Compact only when the consumed prefix becomes significant.
-        if self.input_start > 0 && (self.input_start >= self.chunk_size * 4 || self.input_start * 2 >= self.input_buf.len()) {
+        if self.input_start > 0
+            && (self.input_start >= self.chunk_size * 4
+                || self.input_start * 2 >= self.input_buf.len())
+        {
             let remaining = self.input_buf.len() - self.input_start;
             self.input_buf.copy_within(self.input_start.., 0);
             self.input_buf.truncate(remaining);

@@ -147,8 +147,8 @@ pub fn recommend_model_profile(current_ort_ep: &str) -> ModelProfileRecommendati
         .map(|n| n.get())
         .unwrap_or(8);
     let system_ram_gb = detect_system_ram_gb();
-    let directml_available = cfg!(target_os = "windows")
-        && !current_ort_ep.trim().eq_ignore_ascii_case("cpu");
+    let directml_available =
+        cfg!(target_os = "windows") && !current_ort_ep.trim().eq_ignore_ascii_case("cpu");
     let suggested_ort_ep = if directml_available {
         "directml"
     } else {

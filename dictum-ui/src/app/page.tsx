@@ -1,6 +1,6 @@
-"use client";
+﻿"use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useActivity } from "@/hooks/useActivity";
 import { useAudioDevices } from "@/hooks/useAudioDevices";
 import { useEngine } from "@/hooks/useEngine";
@@ -44,6 +44,7 @@ import {
   upsertDictionary,
   upsertSnippet,
 } from "@/lib/tauri";
+import { motion, AnimatePresence } from "framer-motion";
 
 type Tab = "live" | "history" | "stats" | "dictionary" | "snippets" | "settings";
 type CloudMode = "local_only" | "hybrid" | "cloud_preferred";
@@ -137,6 +138,16 @@ const UPDATE_LAST_CHECKED_STORAGE_KEY = "dictum-update-last-checked-v1";
 const UPDATE_AUTO_INSTALL_IDLE_STORAGE_KEY = "dictum-update-auto-install-idle-v1";
 const UPDATE_TELEMETRY_STORAGE_KEY = "dictum-update-telemetry-v1";
 const UPDATE_IDLE_INSTALL_GRACE_MS = 120_000;
+const PANEL_CACHE_TTL_MS = 30_000;
+const HISTORY_SEARCH_DEBOUNCE_MS = 180;
+const TAB_OPTIONS: Tab[] = ["live", "history", "stats", "dictionary", "snippets", "settings"];
+
+type PanelLoadingState = {
+  history: boolean;
+  stats: boolean;
+  dictionary: boolean;
+  snippets: boolean;
+};
 
 type MicCalibration = {
   pillVisualizerSensitivity: number;
@@ -197,6 +208,7 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("live");
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
   const [selectedDeviceName, setSelectedDeviceName] = useState<string | null>(null);
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [modelProfile, setModelProfile] = useState("distil-large-v3");
   const [performanceProfile, setPerformanceProfile] = useState("whisper_balanced_english");
   const [toggleShortcut, setToggleShortcut] = useState("Ctrl+Shift+Space");
@@ -243,6 +255,12 @@ export default function Home() {
   const [perfSnapshot, setPerfSnapshot] = useState<PerfSnapshot | null>(null);
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
   const [snippets, setSnippets] = useState<SnippetEntry[]>([]);
+  const [panelLoading, setPanelLoading] = useState<PanelLoadingState>({
+    history: false,
+    stats: false,
+    dictionary: false,
+    snippets: false,
+  });
   const [modelCatalog, setModelCatalog] = useState<ModelProfileMetadata[]>([]);
   const [modelRecommendation, setModelRecommendation] = useState<ModelProfileRecommendation | null>(null);
   const [learnedCorrections, setLearnedCorrections] = useState<LearnedCorrection[]>([]);
@@ -254,6 +272,14 @@ export default function Home() {
   const [snippetTrigger, setSnippetTrigger] = useState("");
   const [snippetExpansion, setSnippetExpansion] = useState("");
   const [snippetMode, setSnippetMode] = useState<"slash" | "phrase">("slash");
+  const panelLoadedAtRef = useRef<Record<keyof PanelLoadingState, number>>({
+    history: 0,
+    stats: 0,
+    dictionary: 0,
+    snippets: 0,
+  });
+  const deferredSegments = useDeferredValue(segments);
+  const deferredHistoryQuery = useDeferredValue(historyQuery.trim());
 
   const copyText = useMemo(() => {
     const finals = segments.filter((seg) => seg.kind === "final");
@@ -271,10 +297,10 @@ export default function Home() {
   }, [modelCatalog, modelRecommendation]);
   const lowConfidenceFinals = useMemo(
     () =>
-      segments
+      deferredSegments
         .filter((seg) => seg.kind === "final" && (seg.confidence ?? 1) < 0.74)
         .slice(-6),
-    [segments],
+    [deferredSegments],
   );
   const correctionSuggestions = useMemo(() => {
     const suggestions: Array<{
@@ -452,6 +478,24 @@ export default function Home() {
       // Ignore local storage failures.
     }
   }, [updateTelemetry]);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("dictum-theme-v1");
+      if (saved === "light" || saved === "dark") setTheme(saved);
+    } catch {
+      // Ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem("dictum-theme-v1", theme);
+    } catch {
+      // Ignore
+    }
+  }, [theme]);
 
   useEffect(() => {
     Promise.all([getRuntimeSettings(), getPrivacySettings()])
@@ -1269,31 +1313,84 @@ export default function Home() {
     stopEngine,
   ]);
 
-  const refreshHistory = useCallback(async () => {
-    const page = await getHistory(1, 100, historyQuery || null);
-    setHistoryItems(page.items);
-  }, [historyQuery]);
-
-  const refreshStats = useCallback(async () => {
-    const [statsData, perfData] = await Promise.all([getStats(30), getPerfSnapshot()]);
-    setStats(statsData);
-    setPerfSnapshot(perfData);
+  const setPanelBusy = useCallback((panel: keyof PanelLoadingState, busy: boolean) => {
+    setPanelLoading((prev) => (prev[panel] === busy ? prev : { ...prev, [panel]: busy }));
   }, []);
 
-  const refreshDictionary = useCallback(async () => {
-    setDictionary(await getDictionary());
-  }, []);
+  const shouldUsePanelCache = useCallback(
+    (panel: keyof PanelLoadingState, force: boolean) =>
+      !force && Date.now() - panelLoadedAtRef.current[panel] < PANEL_CACHE_TTL_MS,
+    [],
+  );
 
-  const refreshSnippets = useCallback(async () => {
-    setSnippets(await getSnippets());
-  }, []);
+  const refreshHistory = useCallback(async (force = false, query = historyQuery.trim()) => {
+    if (!force && !query && shouldUsePanelCache("history", false)) {
+      return;
+    }
+    setPanelBusy("history", true);
+    try {
+      const page = await getHistory(1, 100, query || null);
+      setHistoryItems(page.items);
+      panelLoadedAtRef.current.history = Date.now();
+    } finally {
+      setPanelBusy("history", false);
+    }
+  }, [historyQuery, setPanelBusy, shouldUsePanelCache]);
+
+  const refreshStats = useCallback(async (force = false) => {
+    if (!force && shouldUsePanelCache("stats", false)) {
+      return;
+    }
+    setPanelBusy("stats", true);
+    try {
+      const [statsData, perfData] = await Promise.all([getStats(30), getPerfSnapshot()]);
+      setStats(statsData);
+      setPerfSnapshot(perfData);
+      panelLoadedAtRef.current.stats = Date.now();
+    } finally {
+      setPanelBusy("stats", false);
+    }
+  }, [setPanelBusy, shouldUsePanelCache]);
+
+  const refreshDictionary = useCallback(async (force = false) => {
+    if (!force && shouldUsePanelCache("dictionary", false)) {
+      return;
+    }
+    setPanelBusy("dictionary", true);
+    try {
+      setDictionary(await getDictionary());
+      panelLoadedAtRef.current.dictionary = Date.now();
+    } finally {
+      setPanelBusy("dictionary", false);
+    }
+  }, [setPanelBusy, shouldUsePanelCache]);
+
+  const refreshSnippets = useCallback(async (force = false) => {
+    if (!force && shouldUsePanelCache("snippets", false)) {
+      return;
+    }
+    setPanelBusy("snippets", true);
+    try {
+      setSnippets(await getSnippets());
+      panelLoadedAtRef.current.snippets = Date.now();
+    } finally {
+      setPanelBusy("snippets", false);
+    }
+  }, [setPanelBusy, shouldUsePanelCache]);
 
   useEffect(() => {
-    if (tab === "history") void refreshHistory();
     if (tab === "stats") void refreshStats();
     if (tab === "dictionary") void refreshDictionary();
     if (tab === "snippets") void refreshSnippets();
   }, [tab, refreshHistory, refreshStats, refreshDictionary, refreshSnippets]);
+
+  useEffect(() => {
+    if (tab !== "history") return;
+    const timer = window.setTimeout(() => {
+      void refreshHistory(true, deferredHistoryQuery);
+    }, HISTORY_SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [deferredHistoryQuery, refreshHistory, tab]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1366,7 +1463,7 @@ export default function Home() {
     status === "error" ? "Error" :
     status;
 
-  const hasSegments = segments.length > 0;
+  const hasSegments = deferredSegments.length > 0;
   const rmsMeterPercent = clamp(rawRms * 1600, 0, 1) * 100;
   const noiseGatePercent = clamp(activityNoiseGate / 0.03, 0, 1) * 100;
   const clipThresholdPercent = clamp(activityClipThreshold, 0, 1) * 100;
@@ -1396,7 +1493,7 @@ export default function Home() {
           {statusLabel}
         </span>
         <div className="tabs-row">
-          {(["live", "history", "stats", "dictionary", "snippets", "settings"] as Tab[]).map((value) => (
+          {TAB_OPTIONS.map((value) => (
             <button
               key={value}
               className={`tab-btn${tab === value ? " active" : ""}`}
@@ -1416,7 +1513,12 @@ export default function Home() {
       </header>
 
       {showUpdateBanner && (
-        <section className="update-banner" data-no-drag>
+        <motion.section
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, height: 0 }}
+          className="update-banner" data-no-drag
+        >
           <div className="update-banner-copy">
             <span className="update-banner-kicker">Update Ready</span>
             <strong>
@@ -1424,7 +1526,7 @@ export default function Home() {
             </strong>
             <small>
               {updateInfo.releaseName ?? "New release available"}
-              {updatePublishedLabel ? ` · ${updatePublishedLabel}` : ""}
+              {updatePublishedLabel ? " · " : ""}
             </small>
           </div>
           <div className="update-banner-actions">
@@ -1442,7 +1544,7 @@ export default function Home() {
               Skip Version
             </button>
           </div>
-        </section>
+        </motion.section>
       )}
 
       {tab === "live" && (
@@ -1450,8 +1552,8 @@ export default function Home() {
           <div className="transcript-scroll selectable" ref={feedRef}>
             {hasSegments ? (
               <div className="transcript-feed">
-                {segments.map((seg) => (
-                  <div key={seg.id} className={`seg-row ${seg.kind === "partial" ? "is-partial" : "is-final"}`}>
+                {deferredSegments.map((seg) => (
+                  <div key={seg.id} className={`seg-row has-context-menu ${seg.kind === "partial" ? "is-partial" : "is-final"}`}>
                     <p className={seg.kind === "partial" ? "seg-partial" : "seg-final"}>
                       {seg.text}
                       {seg.kind === "final" && typeof seg.confidence === "number" && (
@@ -1461,13 +1563,20 @@ export default function Home() {
                       )}
                     </p>
                     {seg.kind === "final" && (
-                      <div className="seg-actions">
+                      <div className="context-menu">
                         <button
                           type="button"
-                          className="seg-fix-btn"
+                          className="context-action"
+                          onClick={() => { navigator.clipboard.writeText(seg.text).catch(console.error); }}
+                        >
+                          Copy
+                        </button>
+                        <button
+                          type="button"
+                          className="context-action"
                           onClick={() => startInlineFix(seg.id, seg.text)}
                         >
-                          Fix this
+                          Fix
                         </button>
                       </div>
                     )}
@@ -1575,13 +1684,21 @@ export default function Home() {
 
             {isListening && (
               <div className="level-bars" aria-hidden>
-                {Array.from({ length: 7 }).map((_, i) => {
-                  const active = i < Math.ceil(level * 7);
+                {Array.from({ length: 9 }).map((_, i) => {
+                  const distance = Math.abs(i - 4);
+                  const falloff = 1 - (distance * 0.22);
+                  const baseHeight = 4 + (distance * 1.5);
+                  const activeHeight = baseHeight + (level * 22 * falloff);
                   return (
-                    <span
+                    <motion.span
                       key={i}
-                      className={`level-bar${active ? " active" : ""}`}
-                      style={active ? { height: `${4 + level * 13 + i}px` } : undefined}
+                      className="level-bar"
+                      animate={{
+                        height: activeHeight,
+                        opacity: 0.35 + (level * 0.65 * falloff),
+                        backgroundColor: level > 0.05 ? "rgb(var(--accent))" : "rgba(var(--border), 0.9)"
+                      }}
+                      transition={{ type: "spring", bounce: 0.25, duration: 0.35 }}
                     />
                   );
                 })}
@@ -1600,8 +1717,19 @@ export default function Home() {
         </>
       )}
 
-      {tab !== "live" && (
-        <div className="panel-scroll selectable" data-no-drag>
+      <AnimatePresence mode="wait">
+        {tab !== "live" && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+            className="panel-scroll selectable over-panel"
+            data-no-drag
+          >
+
+
+            <div className="panel-content-glass">
           {tab === "history" && (
             <section className="panel">
               <div className="panel-toolbar">
@@ -1611,38 +1739,64 @@ export default function Home() {
                   value={historyQuery}
                   onChange={(e) => setHistoryQuery(e.target.value)}
                 />
-                <button className="action-btn" onClick={() => void refreshHistory()}>Refresh</button>
+                <button
+                  className="action-btn"
+                  onClick={() => void refreshHistory(true, historyQuery.trim())}
+                  disabled={panelLoading.history}
+                >
+                  {panelLoading.history ? "Refreshing..." : "Refresh"}
+                </button>
                 <button
                   className="action-btn"
                   onClick={async () => {
                     await deleteHistory(null, retentionDays);
-                    await refreshHistory();
+                    await refreshHistory(true, historyQuery.trim());
                   }}
+                  disabled={panelLoading.history}
                 >
                   Prune
                 </button>
               </div>
               <div className="panel-list">
-                {historyItems.map((item) => (
-                  <article key={item.id} className="panel-card">
+                {panelLoading.history && historyItems.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">◌</span>
+                    <h3>Loading history</h3>
+                    <p>Pulling your recent dictation sessions.</p>
+                  </div>
+                )}
+                {historyItems.map((item, i) => (
+                  <motion.article
+                    key={item.id}
+                    className="panel-card history-card has-context-menu"
+                    initial={{ opacity: 0, scale: 0.98, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: i * 0.03, ease: [0.16, 1, 0.3, 1] }}
+                  >
                     <div className="panel-meta">
                       <span>{new Date(item.createdAt).toLocaleString()}</span>
                       <span>{item.source}</span>
                       <span>{item.wordCount} words</span>
+                      {item.latencyMs > 0 && <span>{item.latencyMs} ms</span>}
                     </div>
                     <p>{item.text}</p>
-                    <button
-                      className="action-btn"
-                      onClick={async () => {
-                        await deleteHistory([item.id], null);
-                        await refreshHistory();
-                      }}
-                    >
-                      Delete
-                    </button>
-                  </article>
+                    <div className="context-menu">
+                      <button className="context-action" onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(item.text).catch(console.error); }}>Copy</button>
+                      <button className="context-action danger" onClick={async (e) => { e.stopPropagation(); await deleteHistory([item.id], null); await refreshHistory(true, historyQuery.trim()); }}>Delete</button>
+                    </div>
+                  </motion.article>
                 ))}
-                {historyItems.length === 0 && <p className="empty-label">No history yet.</p>}
+                {!panelLoading.history && historyItems.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">◷</span>
+                    <h3>{historyQuery.trim() ? "No matches" : "No history yet"}</h3>
+                    <p>
+                      {historyQuery.trim()
+                        ? "Try a broader search term or clear the filter."
+                        : "Your dictated sessions will be safely archived here for review."}
+                    </p>
+                  </div>
+                )}
               </div>
             </section>
           )}
@@ -1650,27 +1804,52 @@ export default function Home() {
           {tab === "stats" && (
             <section className="panel">
               <div className="panel-toolbar">
-                <button className="action-btn" onClick={() => void refreshStats()}>Refresh</button>
+                <button className="action-btn" onClick={() => void refreshStats(true)} disabled={panelLoading.stats}>
+                  {panelLoading.stats ? "Refreshing..." : "Refresh"}
+                </button>
               </div>
-              {stats ? (
-                <div className="panel-grid">
-                  <div className="stat-card"><b>{stats.totalUtterances}</b><span>Utterances</span></div>
-                  <div className="stat-card"><b>{stats.totalWords}</b><span>Words</span></div>
-                  <div className="stat-card"><b>{Math.round(stats.avgLatencyMs)} ms</b><span>Avg Latency</span></div>
-                  <div className="stat-card">
-                    <b>{`${Math.round(fallbackStubRate)}%`}</b>
-                    <span>Fallback Stub Rate</span>
-                  </div>
-                  <div className="stat-card">
-                    <b>{perfSnapshot?.diagnostics.shortcutToggleDropped ?? 0}</b>
-                    <span>Shortcut Drops</span>
-                  </div>
-                  <div className="stat-card">
-                    <b>{Math.round(finalizeP95)} ms</b>
-                    <span>Finalize p95</span>
-                  </div>
+              {panelLoading.stats && !stats ? (
+                <div className="empty-slate">
+                  <span className="empty-icon" aria-hidden="true">◌</span>
+                  <h3>Loading stats</h3>
+                  <p>Gathering recent usage and performance telemetry.</p>
                 </div>
-              ) : <p className="empty-label">No stats yet.</p>}
+              ) : stats ? (
+                <motion.div
+                  className="panel-grid"
+                  initial="hidden"
+                  animate="visible"
+                  variants={{
+                    hidden: { opacity: 0 },
+                    visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
+                  }}
+                >
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{stats.totalUtterances}</b><span>Utterances</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{stats.totalWords}</b><span>Words</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{Math.round(stats.avgLatencyMs)} ms</b><span>Avg Latency</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{`${Math.round(fallbackStubRate)}%`}</b><span>Fallback Stub Rate</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{perfSnapshot?.diagnostics.shortcutToggleDropped ?? 0}</b><span>Shortcut Drops</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{Math.round(finalizeP95)} ms</b><span>Finalize p95</span>
+                  </motion.div>
+                </motion.div>
+              ) : (
+                <div className="empty-slate">
+                  <span className="empty-icon" aria-hidden="true">⚗</span>
+                  <h3>No stats yet</h3>
+                  <p>Begin dictating to see your system performance charts here.</p>
+                </div>
+              )}
             </section>
           )}
 
@@ -1696,24 +1875,46 @@ export default function Home() {
                     setDictTerm("");
                     setDictAliases("");
                     setDictLanguage("");
-                    await refreshDictionary();
+                    await refreshDictionary(true);
                   }}
+                  disabled={panelLoading.dictionary}
                 >
-                  Add
+                  {panelLoading.dictionary ? "Saving..." : "Add"}
                 </button>
               </div>
               <div className="panel-list">
-                {dictionary.map((entry) => (
-                  <article key={entry.id} className="panel-card">
+                {panelLoading.dictionary && dictionary.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">◌</span>
+                    <h3>Loading dictionary</h3>
+                    <p>Fetching your custom vocabulary.</p>
+                  </div>
+                )}
+                {dictionary.map((entry, i) => (
+                  <motion.article
+                    key={entry.id}
+                    className="panel-card dict-card has-context-menu"
+                    initial={{ opacity: 0, scale: 0.98, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: i * 0.03, ease: [0.16, 1, 0.3, 1] }}
+                  >
                     <div className="panel-meta">
                       <span>{entry.term}</span>
                       <span>{entry.language ?? "any"}</span>
                     </div>
                     <p>{entry.aliases.join(", ") || "No aliases"}</p>
-                    <button className="action-btn" onClick={async () => { await deleteDictionary(entry.id); await refreshDictionary(); }}>Delete</button>
-                  </article>
+                    <div className="context-menu">
+                      <button className="context-action danger" onClick={async (e) => { e.stopPropagation(); await deleteDictionary(entry.id); await refreshDictionary(true); }}>Delete</button>
+                    </div>
+                  </motion.article>
                 ))}
-                {dictionary.length === 0 && <p className="empty-label">No dictionary entries yet.</p>}
+                {!panelLoading.dictionary && dictionary.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">¶</span>
+                    <h3>No dictionary entries</h3>
+                    <p>Add custom vocabulary to help Dictum recognize specialized terms.</p>
+                  </div>
+                )}
               </div>
             </section>
           )}
@@ -1742,24 +1943,46 @@ export default function Home() {
                     });
                     setSnippetTrigger("");
                     setSnippetExpansion("");
-                    await refreshSnippets();
+                    await refreshSnippets(true);
                   }}
+                  disabled={panelLoading.snippets}
                 >
-                  Add
+                  {panelLoading.snippets ? "Saving..." : "Add"}
                 </button>
               </div>
               <div className="panel-list">
-                {snippets.map((entry) => (
-                  <article key={entry.id} className="panel-card">
+                {panelLoading.snippets && snippets.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">◌</span>
+                    <h3>Loading snippets</h3>
+                    <p>Fetching your saved phrase expansions.</p>
+                  </div>
+                )}
+                {snippets.map((entry, i) => (
+                  <motion.article
+                    key={entry.id}
+                    className="panel-card snippet-card has-context-menu"
+                    initial={{ opacity: 0, scale: 0.98, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: i * 0.03, ease: [0.16, 1, 0.3, 1] }}
+                  >
                     <div className="panel-meta">
                       <span>{entry.trigger}</span>
                       <span>{entry.mode}</span>
                     </div>
                     <p>{entry.expansion}</p>
-                    <button className="action-btn" onClick={async () => { await deleteSnippet(entry.id); await refreshSnippets(); }}>Delete</button>
-                  </article>
+                    <div className="context-menu">
+                      <button className="context-action danger" onClick={async (e) => { e.stopPropagation(); await deleteSnippet(entry.id); await refreshSnippets(true); }}>Delete</button>
+                    </div>
+                  </motion.article>
                 ))}
-                {snippets.length === 0 && <p className="empty-label">No snippets yet.</p>}
+                {!panelLoading.snippets && snippets.length === 0 && (
+                  <div className="empty-slate">
+                    <span className="empty-icon" aria-hidden="true">⚡</span>
+                    <h3>No snippets</h3>
+                    <p>Create text expansions that automatically trigger when you dictate.</p>
+                  </div>
+                )}
               </div>
             </section>
           )}
@@ -1867,6 +2090,30 @@ export default function Home() {
               <div className="settings-grid">
                 <article className="settings-card">
                   <div className="settings-card-header">
+                    <h3>Appearance</h3>
+                    <p>Switch between dark and light themes.</p>
+                  </div>
+                  <div className="settings-chip-row">
+                    <button
+                      className={`settings-chip-btn${theme === "dark" ? " settings-save-btn" : ""}`}
+                      onClick={() => setTheme("dark")}
+                    >
+                      Dark
+                    </button>
+                    <button
+                      className={`settings-chip-btn${theme === "light" ? " settings-save-btn" : ""}`}
+                      onClick={() => setTheme("light")}
+                    >
+                      Light
+                    </button>
+                  </div>
+                  <p className="settings-note">
+                    {theme === "dark" ? "Purple accent with dark palette." : "Teal accent with light palette."}
+                  </p>
+                </article>
+
+                <article className="settings-card settings-card-accent">
+                  <div className="settings-card-header">
                     <h3>Core</h3>
                     <p>Runtime model, language, and global controls.</p>
                   </div>
@@ -1949,7 +2196,7 @@ export default function Home() {
                   </div>
                 </article>
 
-                <article className="settings-card">
+                <article className="settings-card settings-card-accent">
                   <div className="settings-card-header">
                     <h3>Audio Intelligence</h3>
                     <p>Sensitivity and gating controls with live metering.</p>
@@ -2270,8 +2517,10 @@ export default function Home() {
               </div>
             </section>
           )}
-        </div>
-      )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {showOnboarding && (
         <div className="onboarding-backdrop" data-no-drag>

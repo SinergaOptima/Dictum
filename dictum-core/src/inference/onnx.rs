@@ -52,7 +52,6 @@ use crate::{
 };
 
 static DEBUG_TRANSCRIBE: OnceLock<bool> = OnceLock::new();
-static LANGUAGE_HINT: OnceLock<DecodeLanguageHint> = OnceLock::new();
 
 fn is_debug_transcribe() -> bool {
     *DEBUG_TRANSCRIBE.get_or_init(|| {
@@ -71,19 +70,17 @@ enum DecodeLanguageHint {
 }
 
 fn decode_language_hint() -> DecodeLanguageHint {
-    *LANGUAGE_HINT.get_or_init(|| {
-        match std::env::var("DICTUM_LANGUAGE_HINT")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "en" | "eng" | "english" => DecodeLanguageHint::English,
-            "zh" | "zh-cn" | "zh-hans" | "mandarin" | "chinese" => DecodeLanguageHint::Mandarin,
-            "ru" | "rus" | "russian" => DecodeLanguageHint::Russian,
-            _ => DecodeLanguageHint::Auto,
-        }
-    })
+    match std::env::var("DICTUM_LANGUAGE_HINT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "en" | "eng" | "english" => DecodeLanguageHint::English,
+        "zh" | "zh-cn" | "zh-hans" | "mandarin" | "chinese" => DecodeLanguageHint::Mandarin,
+        "ru" | "rus" | "russian" => DecodeLanguageHint::Russian,
+        _ => DecodeLanguageHint::Auto,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

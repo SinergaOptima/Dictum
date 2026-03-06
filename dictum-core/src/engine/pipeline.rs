@@ -17,11 +17,11 @@
 //! This entire loop runs in `spawn_blocking`, keeping the Tokio async
 //! executor free for I/O (Tauri IPC, file system, etc.).
 
+use std::sync::OnceLock;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;

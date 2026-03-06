@@ -3,27 +3,33 @@
 //! Each function is registered with `tauri::Builder::invoke_handler` and
 //! callable from the frontend via `invoke(...)`.
 
-use dictum_core::{audio::device::DeviceInfo, ipc::events::EngineStatus};
+use dictum_core::{audio::device::DeviceInfo, engine::EngineConfig, ipc::events::EngineStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::State;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tracing::{info, warn};
 
-use crate::settings::{
-    normalize_cloud_mode, normalize_language_hint, normalize_model_profile, normalize_ort_ep,
-    normalize_performance_profile, normalize_toggle_shortcut, save_settings, LearnedCorrection,
-    RuntimeSettings,
-};
 use crate::model_profiles::{
     model_profile_catalog, recommend_model_profile, ModelProfileMetadata,
     ModelProfileRecommendation,
+};
+use crate::settings::{
+    apply_engine_profile, normalize_cloud_mode, normalize_language_hint, normalize_model_profile,
+    normalize_ort_ep, normalize_performance_profile, normalize_toggle_shortcut, save_settings,
+    LearnedCorrection, RuntimeSettings,
 };
 use crate::state::{AppState, PerfSnapshot};
 use crate::storage::{DictionaryEntry, HistoryPage, PrivacySettings, SnippetEntry, StatsPayload};
 
 const DEFAULT_UPDATE_REPO_SLUG: &str = "latticelabs/dictum";
 const UPDATE_TIMEOUT_SECS: u64 = 45;
+
+fn runtime_engine_config(performance_profile: &str) -> EngineConfig {
+    let mut config = EngineConfig::default();
+    apply_engine_profile(&mut config, performance_profile);
+    config
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,7 +202,10 @@ fn parse_sha256_from_sums(contents: &str, file_name: &str) -> Option<String> {
             continue;
         };
 
-        let name_normalized = name_part.trim().trim_start_matches('*').to_ascii_lowercase();
+        let name_normalized = name_part
+            .trim()
+            .trim_start_matches('*')
+            .to_ascii_lowercase();
         let name_basename = std::path::Path::new(&name_normalized)
             .file_name()
             .and_then(|v| v.to_str())
@@ -234,7 +243,9 @@ fn verify_windows_authenticode(path: &std::path::Path) -> Result<String, String>
     if status.eq_ignore_ascii_case("Valid") {
         Ok(status)
     } else {
-        Err(format!("installer signature status is '{status}', expected 'Valid'"))
+        Err(format!(
+            "installer signature status is '{status}', expected 'Valid'"
+        ))
     }
 }
 
@@ -372,7 +383,10 @@ pub async fn check_for_app_update(
         .trim_start_matches('v')
         .trim_start_matches('V')
         .to_string();
-    let has_update = match (version_tuple(&current_version), version_tuple(&latest_version)) {
+    let has_update = match (
+        version_tuple(&current_version),
+        version_tuple(&latest_version),
+    ) {
         (Some(current), Some(latest)) => latest > current,
         _ => current_version.trim() != latest_version.trim(),
     } && !release.prerelease;
@@ -470,8 +484,8 @@ pub async fn download_and_install_app_update(
         .as_deref()
         .and_then(normalize_sha256_hex)
         .ok_or_else(|| "Missing expected SHA-256 checksum for installer.".to_string())?;
-    let install_path =
-        tauri::async_runtime::spawn_blocking(move || -> Result<(std::path::PathBuf, String), String> {
+    let install_path = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(std::path::PathBuf, String), String> {
             let updates_dir = std::env::temp_dir().join("dictum-updates");
             std::fs::create_dir_all(&updates_dir)
                 .map_err(|e| format!("failed to prepare update directory: {e}"))?;
@@ -523,9 +537,10 @@ pub async fn download_and_install_app_update(
                 ));
             }
             Ok((target_path, actual_sha256))
-        })
-        .await
-        .map_err(|e| format!("installer download task failed: {e}"))??;
+        },
+    )
+    .await
+    .map_err(|e| format!("installer download task failed: {e}"))??;
     let (install_path, actual_sha256) = install_path;
 
     #[cfg(target_os = "windows")]
@@ -593,6 +608,9 @@ pub async fn run_auto_tune(state: State<'_, AppState>) -> Result<AutoTuneResult,
     settings.ort_parallel = ort_parallel;
     settings.performance_profile = normalize_performance_profile(performance_profile);
     settings.normalize();
+    state
+        .engine
+        .update_config(runtime_engine_config(&settings.performance_profile));
 
     std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
     std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
@@ -600,8 +618,14 @@ pub async fn run_auto_tune(state: State<'_, AppState>) -> Result<AutoTuneResult,
         "DICTUM_PERFORMANCE_PROFILE",
         settings.performance_profile.clone(),
     );
-    std::env::set_var("DICTUM_ORT_INTRA_THREADS", settings.ort_intra_threads.to_string());
-    std::env::set_var("DICTUM_ORT_INTER_THREADS", settings.ort_inter_threads.to_string());
+    std::env::set_var(
+        "DICTUM_ORT_INTRA_THREADS",
+        settings.ort_intra_threads.to_string(),
+    );
+    std::env::set_var(
+        "DICTUM_ORT_INTER_THREADS",
+        settings.ort_inter_threads.to_string(),
+    );
     std::env::set_var(
         "DICTUM_ORT_PARALLEL",
         if settings.ort_parallel { "1" } else { "0" },
@@ -683,7 +707,8 @@ pub async fn run_benchmark_auto_tune(
     let activity_sensitivity = (0.34 / (whisper_p70 - noise_gate).max(0.0001)).clamp(1.0, 20.0);
     let pill_sensitivity = (activity_sensitivity * 1.12).clamp(1.0, 20.0);
     let input_gain_boost = (0.02 / whisper_p70.max(0.0001)).clamp(0.5, 8.0);
-    let clip_threshold = (normal_p80.max(ambient_p90 * 12.0).max(whisper_p70 * 8.0)).clamp(0.12, 0.95);
+    let clip_threshold =
+        (normal_p80.max(ambient_p90 * 12.0).max(whisper_p70 * 8.0)).clamp(0.12, 0.95);
 
     settings.activity_noise_gate = noise_gate;
     settings.activity_sensitivity = activity_sensitivity;
@@ -691,6 +716,9 @@ pub async fn run_benchmark_auto_tune(
     settings.input_gain_boost = input_gain_boost;
     settings.activity_clip_threshold = clip_threshold;
     settings.normalize();
+    state
+        .engine
+        .update_config(runtime_engine_config(&settings.performance_profile));
 
     std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
     std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
@@ -698,8 +726,14 @@ pub async fn run_benchmark_auto_tune(
         "DICTUM_PERFORMANCE_PROFILE",
         settings.performance_profile.clone(),
     );
-    std::env::set_var("DICTUM_ORT_INTRA_THREADS", settings.ort_intra_threads.to_string());
-    std::env::set_var("DICTUM_ORT_INTER_THREADS", settings.ort_inter_threads.to_string());
+    std::env::set_var(
+        "DICTUM_ORT_INTRA_THREADS",
+        settings.ort_intra_threads.to_string(),
+    );
+    std::env::set_var(
+        "DICTUM_ORT_INTER_THREADS",
+        settings.ort_inter_threads.to_string(),
+    );
     std::env::set_var(
         "DICTUM_ORT_PARALLEL",
         if settings.ort_parallel { "1" } else { "0" },
@@ -922,6 +956,9 @@ pub async fn set_runtime_settings(
         settings.retention_days = v.clamp(1, 3650);
     }
     settings.normalize();
+    state
+        .engine
+        .update_config(runtime_engine_config(&settings.performance_profile));
 
     let global_shortcut = app.global_shortcut();
     if settings.toggle_shortcut != previous_shortcut {
@@ -943,12 +980,18 @@ pub async fn set_runtime_settings(
     std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
     std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
     if settings.ort_intra_threads > 0 {
-        std::env::set_var("DICTUM_ORT_INTRA_THREADS", settings.ort_intra_threads.to_string());
+        std::env::set_var(
+            "DICTUM_ORT_INTRA_THREADS",
+            settings.ort_intra_threads.to_string(),
+        );
     } else {
         std::env::remove_var("DICTUM_ORT_INTRA_THREADS");
     }
     if settings.ort_inter_threads > 0 {
-        std::env::set_var("DICTUM_ORT_INTER_THREADS", settings.ort_inter_threads.to_string());
+        std::env::set_var(
+            "DICTUM_ORT_INTER_THREADS",
+            settings.ort_inter_threads.to_string(),
+        );
     } else {
         std::env::remove_var("DICTUM_ORT_INTER_THREADS");
     }

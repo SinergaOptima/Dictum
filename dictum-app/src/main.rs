@@ -32,7 +32,9 @@ use dictum_core::{
     DictumEngine,
 };
 use parking_lot::Mutex;
-use settings::{apply_runtime_env_from_settings, default_settings_path, load_settings};
+use settings::{
+    apply_engine_profile, apply_runtime_env_from_settings, default_settings_path, load_settings,
+};
 use state::{AppState, PerfMetrics};
 use storage::{HistoryRecordInput, LocalStore};
 use tauri::{
@@ -83,45 +85,6 @@ fn enforce_single_instance() -> Option<isize> {
 #[cfg(not(target_os = "windows"))]
 fn enforce_single_instance() -> Option<isize> {
     Some(0)
-}
-
-fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
-    match profile {
-        "whisper_balanced_english" => {
-            // Higher whisper sensitivity while keeping enough hangover for quiet tails.
-            config.vad_threshold = 0.00125;
-            config.min_speech_samples = 460;
-            config.max_speech_samples = 96_000;
-            config.vad_hangover_frames = 7;
-            config.enable_partial_inference = true;
-            config.silero_vad_threshold = 0.045;
-        }
-        "latency_short_utterance" => {
-            config.vad_threshold = 0.00195;
-            config.min_speech_samples = 420;
-            config.max_speech_samples = 72_000;
-            config.vad_hangover_frames = 3;
-            config.enable_partial_inference = true;
-            config.silero_vad_threshold = 0.065;
-        }
-        "balanced_general" => {
-            config.vad_threshold = 0.0017;
-            config.min_speech_samples = 600;
-            config.max_speech_samples = 88_000;
-            config.vad_hangover_frames = 4;
-            config.enable_partial_inference = true;
-            config.silero_vad_threshold = 0.058;
-        }
-        _ => {
-            // stability_long_form (default)
-            config.vad_threshold = 0.00145;
-            config.min_speech_samples = 520;
-            config.max_speech_samples = 104_000;
-            config.vad_hangover_frames = 6;
-            config.enable_partial_inference = true;
-            config.silero_vad_threshold = 0.052;
-        }
-    }
 }
 
 fn toggle_engine_from_shortcut<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -495,6 +458,9 @@ fn main() {
             // ── Forward engine events → Tauri event bus ───────────────────
             // Use tauri::async_runtime::spawn to share Tauri's Tokio runtime.
 
+            let shared_speech_end = Arc::new(Mutex::new(None::<Instant>));
+            let shared_speech_end_for_activity = Arc::clone(&shared_speech_end);
+
             let mut transcript_rx = engine_for_setup.subscribe_transcripts();
             let handle1 = app_handle.clone();
             let inject_calls_clone = Arc::clone(&inject_calls_for_setup);
@@ -624,6 +590,7 @@ fn main() {
                                     let inject_elapsed_ms =
                                         inject_started.elapsed().as_secs_f64() * 1000.0;
                                     perf_metrics_clone.lock().record_inject(inject_elapsed_ms);
+                                    let latency_ms = shared_speech_end.lock().take().map(|t| t.elapsed().as_millis() as i64).unwrap_or(0);
                                     let settings_guard = settings_clone.lock();
                                     if settings_guard.history_enabled {
                                         let persist_started = Instant::now();
@@ -634,7 +601,7 @@ fn main() {
                                             } else {
                                                 "local".into()
                                             },
-                                            latency_ms: 0,
+                                            latency_ms,
                                             dictionary_applied,
                                             snippet_applied,
                                         }) {
@@ -703,9 +670,14 @@ fn main() {
             let mut activity_rx = engine_for_setup.subscribe_activity();
             let handle3 = app_handle.clone();
             tauri::async_runtime::spawn(async move {
+                let mut was_speech = false;
                 loop {
                     match activity_rx.recv().await {
                         Ok(event) => {
+                            if was_speech && !event.is_speech {
+                                *shared_speech_end_for_activity.lock() = Some(Instant::now());
+                            }
+                            was_speech = event.is_speech;
                             if let Err(e) = handle3.emit("dictum://activity", &event) {
                                 tracing::warn!("emit activity: {e}");
                             }
