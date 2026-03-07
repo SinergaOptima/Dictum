@@ -59,6 +59,40 @@ The workflow generates and uploads:
 
 On tag builds, these are attached to the GitHub Release automatically.
 
+## 4.1) Writing release notes
+
+Do not pass release notes to `gh release create` or `gh release edit` as a single escaped string containing `\n`.
+GitHub will render those literal backslash characters instead of real line breaks.
+
+Prefer one of these approaches:
+
+```powershell
+$notes = @'
+Public 0.1.8 release.
+
+## Highlights
+- item one
+- item two
+'@
+Set-Content .tmp-release-notes.md $notes
+gh release edit v0.1.8 --notes-file .tmp-release-notes.md
+```
+
+or:
+
+```powershell
+$notes = @'
+Public 0.1.8 release.
+
+## Highlights
+- item one
+- item two
+'@
+gh release create v0.1.8 ... --notes-file .tmp-release-notes.md
+```
+
+If using the second pattern, write the here-string to a file first. `--notes-file` is the safest path.
+
 ## 5) Pre-release checklist for Dictum
 
 Before cutting a public release, verify all of the following locally or in CI:
