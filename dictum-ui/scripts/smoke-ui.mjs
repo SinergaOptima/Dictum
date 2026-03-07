@@ -105,6 +105,7 @@ async function startManagedServer() {
 function buildInitScript(config) {
   return `
     (() => {
+      const currentVersion = "0.1.8-dev.4";
       const state = {
         runtimeSettings: {
           modelProfile: "distil-large-v3",
@@ -167,6 +168,22 @@ function buildInitScript(config) {
             modeAffinity: null,
             appProfileAffinity: null,
             lastUsedAt: "2026-03-07T12:00:00Z"
+          },
+          {
+            heard: "ship it",
+            corrected: "ShipIt",
+            hits: 1,
+            modeAffinity: "command",
+            appProfileAffinity: "missing-profile",
+            lastUsedAt: null
+          },
+          {
+            heard: "slash deploy",
+            corrected: "/deploy",
+            hits: 1,
+            modeAffinity: "command",
+            appProfileAffinity: null,
+            lastUsedAt: "2025-10-01T10:00:00Z"
           }
         ],
         perfSnapshot: {
@@ -201,8 +218,8 @@ function buildInitScript(config) {
         historyPage: { items: [], total: 0, page: 1, pageSize: 50 },
         diagnosticsBundle: null,
         updateInfo: {
-          currentVersion: "0.1.8-dev.3",
-          latestVersion: "0.1.8-dev.3",
+          currentVersion,
+          latestVersion: currentVersion,
           hasUpdate: false,
           repoSlug: "sinergaoptima/dictum",
           releaseName: null,
@@ -217,35 +234,74 @@ function buildInitScript(config) {
         }
       };
 
-      const diagnosticsBundle = {
-        generatedAt: new Date().toISOString(),
-        appVersion: "0.1.8-dev.3",
-        updateRepoSlug: "sinergaoptima/dictum",
-        settingsPath: "C:/Users/Test/AppData/Roaming/Dictum/settings.json",
-        activeAppContext: state.activeAppContext,
-        runtimeSettings: state.runtimeSettings,
-        privacySettings: state.privacySettings,
-        perfSnapshot: state.perfSnapshot,
-        historyStorage: {
-          dbPath: "C:/Users/Test/AppData/Roaming/Dictum/history.db",
-          totalRecords: 0,
-          oldestCreatedAt: null,
-          newestCreatedAt: null
-        },
-        devices: [
-          { name: "Microphone (USB)", isDefault: true, isLoopbackLike: false, sampleRate: 48000, channels: 1 }
-        ],
-        correctionDiagnostics: {
+      const devices = [
+        { name: "Microphone (USB)", isDefault: true, isLoopbackLike: false, sampleRate: 48000, channels: 1 }
+      ];
+
+      const buildCorrectionDiagnostics = () => {
+        const profileNameById = new Map(state.appProfiles.map((profile) => [profile.id, profile.name]));
+        const summarizeRule = (rule) => ({
+          ...rule,
+          appProfileName: rule.appProfileAffinity ? profileNameById.get(rule.appProfileAffinity) || null : null
+        });
+        const topRules = [...state.learnedCorrections]
+          .sort((a, b) => (b.hits - a.hits) || String(b.lastUsedAt || "").localeCompare(String(a.lastUsedAt || "")))
+          .slice(0, 12)
+          .map(summarizeRule);
+        const recentRules = [...state.learnedCorrections]
+          .filter((rule) => !!rule.lastUsedAt)
+          .sort((a, b) => String(b.lastUsedAt || "").localeCompare(String(a.lastUsedAt || "")))
+          .slice(0, 8)
+          .map(summarizeRule);
+        const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+        return {
           totalRules: state.learnedCorrections.length,
-          globalRules: 1,
-          modeScopedRules: 0,
-          profileScopedRules: 0,
-          unusedRules: 0,
-          topRules: state.learnedCorrections.map((r) => ({ ...r, appProfileName: null })),
-          recentRules: state.learnedCorrections.map((r) => ({ ...r, appProfileName: null }))
-        }
+          globalRules: state.learnedCorrections.filter((rule) => !rule.modeAffinity && !rule.appProfileAffinity).length,
+          modeScopedRules: state.learnedCorrections.filter((rule) => !!rule.modeAffinity && !rule.appProfileAffinity).length,
+          profileScopedRules: state.learnedCorrections.filter((rule) => !!rule.appProfileAffinity).length,
+          unusedRules: state.learnedCorrections.filter((rule) => rule.hits <= 1 && !rule.lastUsedAt).length,
+          orphanedProfileRules: state.learnedCorrections.filter((rule) => rule.appProfileAffinity && !profileNameById.has(rule.appProfileAffinity)).length,
+          staleRules: state.learnedCorrections.filter((rule) => {
+            if (rule.hits > 2 || !rule.lastUsedAt) return false;
+            const ageMs = Date.now() - new Date(rule.lastUsedAt).getTime();
+            return Number.isFinite(ageMs) && ageMs >= ninetyDaysMs;
+          }).length,
+          topRules,
+          recentRules
+        };
       };
-      state.diagnosticsBundle = diagnosticsBundle;
+
+      const refreshDiagnostics = () => {
+        state.diagnosticsBundle = {
+          generatedAt: new Date().toISOString(),
+          appVersion: currentVersion,
+          updateRepoSlug: "sinergaoptima/dictum",
+          settingsPath: "C:/Users/Test/AppData/Roaming/Dictum/settings.json",
+          settingsHealth: {
+            loadedSchemaVersion: 0,
+            currentSchemaVersion: 1,
+            migrationApplied: true,
+            migrationNotes: [
+              "Legacy settings file had no schema version marker.",
+              "Settings values were normalized on load to match current app rules."
+            ]
+          },
+          activeAppContext: state.activeAppContext,
+          runtimeSettings: state.runtimeSettings,
+          privacySettings: state.privacySettings,
+          perfSnapshot: state.perfSnapshot,
+          historyStorage: {
+            dbPath: "C:/Users/Test/AppData/Roaming/Dictum/history.db",
+            totalRecords: 0,
+            oldestCreatedAt: null,
+            newestCreatedAt: null
+          },
+          devices,
+          correctionDiagnostics: buildCorrectionDiagnostics()
+        };
+      };
+
+      refreshDiagnostics();
 
       const listeners = new Map();
       let callbackId = 0;
@@ -264,7 +320,7 @@ function buildInitScript(config) {
         invoke: async (cmd, args = {}) => {
           switch (cmd) {
             case "plugin:app|version":
-              return "0.1.8-dev.3";
+              return currentVersion;
             case "plugin:event|listen":
               return Math.floor(Math.random() * 10000);
             case "plugin:event|unlisten":
@@ -272,7 +328,7 @@ function buildInitScript(config) {
             case "get_preferred_input_device":
               return "Microphone (USB)";
             case "list_audio_devices":
-              return diagnosticsBundle.devices;
+              return devices;
             case "get_runtime_settings":
               return state.runtimeSettings;
             case "get_privacy_settings":
@@ -307,17 +363,19 @@ function buildInitScript(config) {
               return state.updateInfo;
             case "set_runtime_settings":
               state.runtimeSettings = { ...state.runtimeSettings, ...Object.fromEntries(Object.entries(args).filter(([, v]) => v !== null)) };
-              state.diagnosticsBundle.runtimeSettings = state.runtimeSettings;
+              refreshDiagnostics();
               return state.runtimeSettings;
             case "upsert_app_profile": {
               const profile = args.profile;
               const idx = state.appProfiles.findIndex((p) => p.id === profile.id);
               if (idx >= 0) state.appProfiles[idx] = profile;
               else state.appProfiles.push(profile);
+              refreshDiagnostics();
               return state.appProfiles;
             }
             case "delete_app_profile":
               state.appProfiles = state.appProfiles.filter((p) => p.id !== args.id);
+              refreshDiagnostics();
               return state.appProfiles;
             case "learn_correction": {
               state.learnedCorrections.push({
@@ -328,13 +386,45 @@ function buildInitScript(config) {
                 appProfileAffinity: args.appProfileAffinity,
                 lastUsedAt: new Date().toISOString()
               });
-              state.diagnosticsBundle.correctionDiagnostics.totalRules = state.learnedCorrections.length;
+              refreshDiagnostics();
               return state.learnedCorrections;
+            }
+            case "prune_learned_corrections": {
+              let removedUnused = 0;
+              let removedOrphanedProfiles = 0;
+              let removedStale = 0;
+              const profileIds = new Set(state.appProfiles.map((profile) => profile.id));
+              const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+              state.learnedCorrections = state.learnedCorrections.filter((rule) => {
+                const isUnused = !!args.removeUnused && rule.hits <= 1 && !rule.lastUsedAt;
+                const isOrphaned =
+                  !!args.removeOrphanedProfiles &&
+                  !!rule.appProfileAffinity &&
+                  !profileIds.has(rule.appProfileAffinity);
+                const isStale =
+                  !!args.removeStale &&
+                  rule.hits <= 2 &&
+                  !!rule.lastUsedAt &&
+                  Number.isFinite(Date.now() - new Date(rule.lastUsedAt).getTime()) &&
+                  Date.now() - new Date(rule.lastUsedAt).getTime() >= ninetyDaysMs;
+                if (isUnused) removedUnused += 1;
+                if (isOrphaned) removedOrphanedProfiles += 1;
+                if (isStale) removedStale += 1;
+                return !(isUnused || isOrphaned || isStale);
+              });
+              refreshDiagnostics();
+              return {
+                rules: state.learnedCorrections,
+                removedUnused,
+                removedOrphanedProfiles,
+                removedStale
+              };
             }
             case "delete_learned_correction":
               state.learnedCorrections = state.learnedCorrections.filter((r) =>
                 !(r.heard === args.heard && r.corrected === args.corrected)
               );
+              refreshDiagnostics();
               return state.learnedCorrections;
             default:
               return null;
@@ -412,9 +502,33 @@ async function runSettingsAndStatsSmoke(browser) {
   await page.getByRole("button", { name: /import profiles/i }).click();
   await assertText(page, 'Failed to import app profiles: Profile 1: appMatch must resolve to a Windows executable like "cursor.exe".');
 
+  await profileImport.fill('[{"id":"dup-profile","name":"Cursor One","appMatch":"cursor.exe","dictationMode":"coding"},{"id":"dup-profile","name":"Cursor Two","appMatch":"slack.exe","dictationMode":"conversation"}]');
+  await page.getByRole("button", { name: /import profiles/i }).click();
+  await assertText(page, 'Failed to import app profiles: Duplicate profile id "dup-profile" found in imported profiles.');
+
+  await profileImport.fill('[{"name":"Slack Messaging","appMatch":"C:\\\\Program Files\\\\Slack\\\\slack.exe","dictationMode":"conversation","phraseBiasTerms":["Dictum"],"postUtteranceRefine":true,"enabled":true}]');
+  await page.getByRole("button", { name: /import profiles/i }).click();
+  await assertText(page, "Imported 1 app profile.");
+  await page.getByText("slack.exe", { exact: true }).waitFor({ timeout: 10000 });
+
+  await correctionImport.fill('[{"heard":"ship it","corrected":"ShipIt","hits":1,"appProfileAffinity":"missing-profile"}]');
+  await page.getByRole("button", { name: /import corrections/i }).click();
+  await assertText(page, 'Failed to import learned corrections: Correction 1: appProfileAffinity "missing-profile" does not match any saved app profile.');
+
+  await correctionImport.fill('[{"heard":"slash deploy","corrected":"/deploy","modeAffinity":"command"},{"heard":"slash deploy","corrected":"/deploy","modeAffinity":"command"}]');
+  await page.getByRole("button", { name: /import corrections/i }).click();
+  await assertText(page, 'Failed to import learned corrections: Correction 2: duplicate scoped correction rule "slash deploy" -> "/deploy".');
+
+  await assertText(page, "1 orphaned");
+  await page.getByRole("button", { name: /prune orphaned/i }).click();
+  await assertText(page, "Pruned 1 correction rule");
+  await assertText(page, "0 orphaned");
+
   await page.getByRole("button", { name: /stats/i }).click();
   await assertText(page, "Release Readiness");
   await assertText(page, "Smoke Benchmark Baseline");
+  await page.getByRole("heading", { name: /settings health/i }).waitFor({ timeout: 10000 });
+  await page.getByText("Loaded Schema", { exact: true }).waitFor({ timeout: 10000 });
   await page.getByRole("button", { name: /copy checklist/i }).click();
   await page.getByRole("button", { name: /checklist copied/i }).waitFor({ timeout: 10000 });
   await page.getByRole("button", { name: /export file/i }).click();

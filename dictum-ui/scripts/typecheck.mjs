@@ -48,16 +48,16 @@ function isRetryable(output) {
 }
 
 let lastCode = 1;
-for (let attempt = 1; attempt <= 3; attempt += 1) {
+for (let attempt = 1; attempt <= 20; attempt += 1) {
   const result = await runTsc();
   lastCode = result.code;
   if (result.code === 0) {
     process.exit(0);
   }
-  if (attempt === 3 || !isRetryable(result.output)) {
+  if (attempt === 20 || !isRetryable(result.output)) {
     process.exit(result.code);
   }
-  await sleep(1200);
+  await sleep(1500);
 }
 
 process.exit(lastCode);
