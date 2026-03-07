@@ -421,12 +421,25 @@ export function useCorrectionsManager({
         throw new Error("No learned corrections found in the pasted JSON.");
       }
       const normalized = parsed.map((rule, index) => normalizeImportedCorrection(rule, index));
+      const seenRules = new Set<string>();
       normalized.forEach((rule, index) => {
         if (rule.appProfileAffinity && !profileIds.has(rule.appProfileAffinity)) {
           throw new Error(
             `Correction ${index + 1}: appProfileAffinity "${rule.appProfileAffinity}" does not match any saved app profile.`,
           );
         }
+        const scopedKey = [
+          rule.heard.trim().toLowerCase(),
+          rule.corrected.trim().toLowerCase(),
+          rule.modeAffinity ?? "",
+          rule.appProfileAffinity ?? "",
+        ].join("::");
+        if (seenRules.has(scopedKey)) {
+          throw new Error(
+            `Correction ${index + 1}: duplicate scoped correction rule "${rule.heard}" -> "${rule.corrected}".`,
+          );
+        }
+        seenRules.add(scopedKey);
       });
       let latest = learnedCorrections;
       for (const rule of normalized) {

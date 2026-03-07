@@ -455,13 +455,21 @@ mod tests {
             last_used_at: None,
         }];
 
-        let (text, applied) =
-            apply_learned_corrections("ship it now", &corrections, "command", Some("slack-profile"));
+        let (text, applied) = apply_learned_corrections(
+            "ship it now",
+            &corrections,
+            "command",
+            Some("slack-profile"),
+        );
         assert_eq!(text, "ShipIt now");
         assert_eq!(applied.len(), 1);
 
-        let (text_miss, applied_miss) =
-            apply_learned_corrections("ship it now", &corrections, "command", Some("cursor-profile"));
+        let (text_miss, applied_miss) = apply_learned_corrections(
+            "ship it now",
+            &corrections,
+            "command",
+            Some("cursor-profile"),
+        );
         assert_eq!(text_miss, "ship it now");
         assert!(applied_miss.is_empty());
     }
@@ -484,6 +492,18 @@ fn main() {
 
     let settings_path = default_settings_path();
     let app_settings = load_settings(&settings_path);
+    if app_settings.needs_persist_after_load() {
+        if let Err(error) = save_settings(&settings_path, &app_settings) {
+            tracing::warn!("failed to persist normalized settings on startup: {error}");
+        } else {
+            info!(
+                loaded_schema_version = app_settings.loaded_schema_version,
+                current_schema_version = settings::CURRENT_SETTINGS_SCHEMA_VERSION,
+                migration_notes = ?app_settings.migration_notes,
+                "persisted normalized settings on startup"
+            );
+        }
+    }
     apply_runtime_env_from_settings(&app_settings, RuntimeEnvMode::FillMissing);
     info!(
         settings_path = ?settings_path,

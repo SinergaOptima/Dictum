@@ -111,6 +111,13 @@ Improve recognition usefulness for real workflows by making dictation behavior c
 - prune actions for unused, stale, and orphaned correction rules
 - validation for missing app-profile correction affinity
 
+The remaining public-release work after `dev.3` is:
+
+- diagnostics export visibility for settings-schema health and migration notes
+- stricter duplicate validation for imported app profiles and learned corrections
+- smoke coverage for normalization, duplicate rejection, orphan pruning, and settings-health visibility
+- final stabilization, packaging, and release gating for `dev.4`, `dev.5`, and public `0.1.8`
+
 The next execution plans are documented in `docs/DICTUM_0.1.8_DEV2_DEV4_PLAN.md`.
 
 ## Deferred Until Proven Necessary

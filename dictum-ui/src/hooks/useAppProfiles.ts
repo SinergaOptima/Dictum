@@ -225,8 +225,19 @@ export function useAppProfiles({ tab, setRuntimeMsg }: UseAppProfilesOptions) {
         throw new Error("No app profiles found in the pasted JSON.");
       }
       const normalized = parsed.map((profile, index) => normalizeImportedProfile(profile, index));
+      const seenIds = new Set<string>();
+      const seenNames = new Set<string>();
       const seenMatches = new Set<string>();
       for (const profile of normalized) {
+        if (seenIds.has(profile.id)) {
+          throw new Error(`Duplicate profile id "${profile.id}" found in imported profiles.`);
+        }
+        seenIds.add(profile.id);
+        const normalizedName = profile.name.trim().toLowerCase();
+        if (seenNames.has(normalizedName)) {
+          throw new Error(`Duplicate profile name "${profile.name}" found in imported profiles.`);
+        }
+        seenNames.add(normalizedName);
         if (seenMatches.has(profile.appMatch)) {
           throw new Error(`Duplicate appMatch "${profile.appMatch}" found in imported profiles.`);
         }

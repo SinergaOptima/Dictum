@@ -386,6 +386,12 @@ export interface DiagnosticsBundle {
   appVersion: string;
   updateRepoSlug: string;
   settingsPath: string;
+  settingsHealth: {
+    loadedSchemaVersion: number;
+    currentSchemaVersion: number;
+    migrationApplied: boolean;
+    migrationNotes: string[];
+  };
   activeAppContext: ActiveAppContext;
   runtimeSettings: RuntimeSettings;
   privacySettings: PrivacySettings;

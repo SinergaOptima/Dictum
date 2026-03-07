@@ -16,10 +16,10 @@ use crate::model_profiles::{
     ModelProfileRecommendation,
 };
 use crate::settings::{
-    normalize_cloud_mode, normalize_language_hint, normalize_model_profile, normalize_ort_ep,
-    normalize_dictation_mode, normalize_performance_profile, normalize_toggle_shortcut,
-    resolve_app_profile, save_settings, sync_runtime_with_settings, AppProfile,
-    LearnedCorrection, RuntimeEnvMode, RuntimeSettings,
+    normalize_cloud_mode, normalize_dictation_mode, normalize_language_hint,
+    normalize_model_profile, normalize_ort_ep, normalize_performance_profile,
+    normalize_toggle_shortcut, resolve_app_profile, save_settings, sync_runtime_with_settings,
+    AppProfile, LearnedCorrection, RuntimeEnvMode, RuntimeSettings, SettingsHealth,
 };
 use crate::state::{AppState, PerfSnapshot};
 use crate::storage::{
@@ -77,6 +77,7 @@ pub struct DiagnosticsBundle {
     pub app_version: String,
     pub update_repo_slug: String,
     pub settings_path: String,
+    pub settings_health: SettingsHealth,
     pub active_app_context: ActiveAppContext,
     pub runtime_settings: RuntimeSettings,
     pub privacy_settings: PrivacySettings,
@@ -828,19 +829,19 @@ pub async fn learn_correction(
 
     let mut settings = state.settings.lock();
     if let Some(profile_id) = app_profile_affinity.as_deref() {
-        if !settings.app_profiles.iter().any(|profile| profile.id == profile_id) {
+        if !settings
+            .app_profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
             return Err("The selected app profile no longer exists. Save this correction as Global or Mode, or recreate the profile.".into());
         }
     }
-    if let Some(existing) = settings
-        .learned_corrections
-        .iter_mut()
-        .find(|c| {
-            c.heard.eq_ignore_ascii_case(&heard)
-                && c.mode_affinity == mode_affinity
-                && c.app_profile_affinity == app_profile_affinity
-        })
-    {
+    if let Some(existing) = settings.learned_corrections.iter_mut().find(|c| {
+        c.heard.eq_ignore_ascii_case(&heard)
+            && c.mode_affinity == mode_affinity
+            && c.app_profile_affinity == app_profile_affinity
+    }) {
         existing.corrected = corrected.clone();
         existing.hits = existing.hits.saturating_add(1);
         existing.mode_affinity = mode_affinity.clone();
@@ -856,14 +857,12 @@ pub async fn learn_correction(
             last_used_at: Some(chrono::Utc::now().to_rfc3339()),
         });
     }
-    settings
-        .learned_corrections
-        .sort_by(|a, b| {
-            b.hits
-                .cmp(&a.hits)
-                .then_with(|| b.last_used_at.cmp(&a.last_used_at))
-                .then_with(|| a.heard.cmp(&b.heard))
-        });
+    settings.learned_corrections.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
     settings.normalize();
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
 
@@ -1019,7 +1018,11 @@ pub async fn upsert_app_profile(
     profile: AppProfile,
 ) -> Result<Vec<AppProfile>, String> {
     let mut settings = state.settings.lock();
-    if let Some(existing) = settings.app_profiles.iter_mut().find(|p| p.id == profile.id) {
+    if let Some(existing) = settings
+        .app_profiles
+        .iter_mut()
+        .find(|p| p.id == profile.id)
+    {
         *existing = profile;
     } else {
         settings.app_profiles.push(profile);
@@ -1043,7 +1046,9 @@ pub async fn delete_app_profile(
 
 /// Return the current foreground app and any matched app profile override.
 #[tauri::command]
-pub async fn get_active_app_context(state: State<'_, AppState>) -> Result<ActiveAppContext, String> {
+pub async fn get_active_app_context(
+    state: State<'_, AppState>,
+) -> Result<ActiveAppContext, String> {
     let settings = state.settings.lock();
     Ok(current_active_app_context(&settings))
 }
@@ -1072,7 +1077,10 @@ fn rule_has_valid_profile(
     rule: &LearnedCorrection,
 ) -> bool {
     match rule.app_profile_affinity.as_deref() {
-        Some(profile_id) => settings.app_profiles.iter().any(|profile| profile.id == profile_id),
+        Some(profile_id) => settings
+            .app_profiles
+            .iter()
+            .any(|profile| profile.id == profile_id),
         None => true,
     }
 }
@@ -1327,6 +1335,7 @@ pub async fn get_diagnostics_bundle(
 ) -> Result<DiagnosticsBundle, String> {
     let settings = state.settings.lock();
     let active_app_context = current_active_app_context(&settings);
+    let settings_health = settings.settings_health();
     let runtime_settings = settings.runtime_settings();
     let privacy_settings = PrivacySettings {
         history_enabled: runtime_settings.history_enabled,
@@ -1343,6 +1352,7 @@ pub async fn get_diagnostics_bundle(
         app_version: app.package_info().version.to_string(),
         update_repo_slug,
         settings_path: state.settings_path.display().to_string(),
+        settings_health,
         active_app_context,
         runtime_settings,
         privacy_settings,
@@ -1499,8 +1509,9 @@ pub async fn delete_snippet(state: State<'_, AppState>, id: String) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        build_correction_diagnostics, correction_matches_delete_target, normalize_repo_slug, parse_sha256_from_sums,
-        select_checksums_asset, select_installer_asset, version_tuple, GitHubAsset,
+        build_correction_diagnostics, correction_matches_delete_target, normalize_repo_slug,
+        parse_sha256_from_sums, select_checksums_asset, select_installer_asset, version_tuple,
+        GitHubAsset,
     };
     use crate::settings::{AppProfile, AppSettings, LearnedCorrection};
 

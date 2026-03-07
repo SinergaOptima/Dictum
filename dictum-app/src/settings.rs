@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use dictum_core::{engine::EngineConfig, DictumEngine};
 use serde::{Deserialize, Serialize};
 
+pub const CURRENT_SETTINGS_SCHEMA_VERSION: usize = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LearnedCorrection {
@@ -36,6 +38,7 @@ pub struct AppProfile {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct AppSettings {
+    pub settings_schema_version: usize,
     pub preferred_input_device: Option<String>,
     pub model_profile: String,
     pub performance_profile: String,
@@ -62,11 +65,18 @@ pub struct AppSettings {
     pub retention_days: usize,
     pub learned_corrections: Vec<LearnedCorrection>,
     pub app_profiles: Vec<AppProfile>,
+    #[serde(skip)]
+    pub loaded_schema_version: usize,
+    #[serde(skip)]
+    pub migration_applied: bool,
+    #[serde(skip)]
+    pub migration_notes: Vec<String>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            settings_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
             preferred_input_device: None,
             model_profile: "distil-large-v3".into(),
             performance_profile: "whisper_balanced_english".into(),
@@ -93,8 +103,20 @@ impl Default for AppSettings {
             retention_days: 90,
             learned_corrections: Vec::new(),
             app_profiles: Vec::new(),
+            loaded_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
+            migration_applied: false,
+            migration_notes: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsHealth {
+    pub loaded_schema_version: usize,
+    pub current_schema_version: usize,
+    pub migration_applied: bool,
+    pub migration_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +157,7 @@ pub enum RuntimeEnvMode {
 
 impl AppSettings {
     pub fn normalize(&mut self) {
+        self.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
         self.model_profile = normalize_model_profile(&self.model_profile);
         self.performance_profile = normalize_performance_profile(&self.performance_profile);
         self.dictation_mode = normalize_dictation_mode(&self.dictation_mode);
@@ -178,6 +201,19 @@ impl AppSettings {
             .as_ref()
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
+    }
+
+    pub fn settings_health(&self) -> SettingsHealth {
+        SettingsHealth {
+            loaded_schema_version: self.loaded_schema_version,
+            current_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
+            migration_applied: self.migration_applied,
+            migration_notes: self.migration_notes.clone(),
+        }
+    }
+
+    pub fn needs_persist_after_load(&self) -> bool {
+        self.migration_applied
     }
 
     pub fn runtime_settings(&self) -> RuntimeSettings {
@@ -337,7 +373,11 @@ fn normalize_app_profiles(profiles: &[AppProfile]) -> Vec<AppProfile> {
             enabled: profile.enabled,
         });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.app_match.cmp(&b.app_match)));
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.app_match.cmp(&b.app_match))
+    });
     out
 }
 
@@ -500,9 +540,10 @@ fn set_runtime_var(name: &str, value: Option<String>, mode: RuntimeEnvMode) {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_app_profiles, normalize_learned_corrections, resolve_app_profile, AppProfile,
-        AppSettings, LearnedCorrection,
+        load_settings, normalize_app_profiles, normalize_learned_corrections, resolve_app_profile,
+        AppProfile, AppSettings, LearnedCorrection, CURRENT_SETTINGS_SCHEMA_VERSION,
     };
+    use std::fs;
 
     #[test]
     fn normalize_learned_corrections_keeps_distinct_context_variants() {
@@ -611,6 +652,51 @@ mod tests {
         settings.normalize();
 
         assert!(resolve_app_profile(&settings, Some("mycode-helper.exe")).is_none());
+    }
+
+    #[test]
+    fn load_settings_marks_legacy_schema_and_normalization_notes() {
+        let unique = format!(
+            "dictum-settings-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::write(
+            &path,
+            r#"{
+              "dictationMode": "code",
+              "appProfiles": [{
+                "id": "cursor",
+                "name": "Cursor",
+                "appMatch": "C:\\Program Files\\Cursor\\Cursor.exe",
+                "dictationMode": "coding",
+                "phraseBiasTerms": [],
+                "postUtteranceRefine": true,
+                "enabled": true
+              }]
+            }"#,
+        )
+        .expect("write settings fixture");
+
+        let loaded = load_settings(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(loaded.loaded_schema_version, 0);
+        assert_eq!(
+            loaded.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
+        assert!(loaded.migration_applied);
+        assert!(loaded
+            .migration_notes
+            .iter()
+            .any(|note| note.contains("Legacy settings file had no schema version marker.")));
+        assert_eq!(loaded.dictation_mode, "coding");
+        assert_eq!(loaded.app_profiles[0].app_match, "cursor.exe");
     }
 }
 
@@ -729,11 +815,42 @@ pub fn default_settings_path() -> PathBuf {
 }
 
 pub fn load_settings(path: &Path) -> AppSettings {
-    let mut settings = fs::read_to_string(path)
+    let Some(raw) = fs::read_to_string(path).ok() else {
+        return AppSettings::default();
+    };
+
+    let loaded_schema_version = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|raw| serde_json::from_str::<AppSettings>(&raw).ok())
-        .unwrap_or_default();
+        .and_then(|value| {
+            value
+                .get("settingsSchemaVersion")
+                .and_then(|entry| entry.as_u64())
+        })
+        .map(|value| value as usize)
+        .unwrap_or(0);
+
+    let mut settings = serde_json::from_str::<AppSettings>(&raw).unwrap_or_default();
+    let pre_normalize_snapshot = serde_json::to_value(&settings).ok();
     settings.normalize();
+    let post_normalize_snapshot = serde_json::to_value(&settings).ok();
+    settings.loaded_schema_version = loaded_schema_version;
+    settings.migration_applied = loaded_schema_version < CURRENT_SETTINGS_SCHEMA_VERSION
+        || pre_normalize_snapshot != post_normalize_snapshot;
+    if loaded_schema_version == 0 {
+        settings
+            .migration_notes
+            .push("Legacy settings file had no schema version marker.".into());
+    } else if loaded_schema_version < CURRENT_SETTINGS_SCHEMA_VERSION {
+        settings.migration_notes.push(format!(
+            "Settings schema upgraded from v{} to v{}.",
+            loaded_schema_version, CURRENT_SETTINGS_SCHEMA_VERSION
+        ));
+    }
+    if pre_normalize_snapshot != post_normalize_snapshot {
+        settings
+            .migration_notes
+            .push("Settings values were normalized on load to match current app rules.".into());
+    }
     settings
 }
 

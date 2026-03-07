@@ -77,4 +77,13 @@ For regression triage, pair benchmark results with a diagnostics export from the
 2. In the `Stats` tab, use `Export File` to write a diagnostics bundle locally.
 3. Record the active dictation mode, matched app profile, and relevant benchmark baseline used for comparison.
 
-This keeps perf snapshots, correction diagnostics, and active-context metadata together when investigating tuning changes.
+This keeps perf snapshots, correction diagnostics, active-context metadata, and settings-schema health together when investigating tuning changes.
+
+## Release gate expectations
+
+Before cutting a public `0.1.8` release, the benchmark review should explicitly answer:
+
+- which dictation mode the comparison was run against
+- whether a matched app profile was active
+- whether the diagnostics export reported any settings migration notes
+- whether correction diagnostics showed orphaned or stale rules during the validation run

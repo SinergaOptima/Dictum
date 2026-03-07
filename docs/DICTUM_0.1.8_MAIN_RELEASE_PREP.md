@@ -30,11 +30,13 @@ Required work:
 - add benchmark notes and expectations for `conversation`, `coding`, and `command`
 - verify settings migration behavior for correction metadata and app-profile fields
 - tighten import/export edge cases one more time based on `dev.3` usage
+- surface settings schema health directly in diagnostics and the Stats tab
 
 Acceptance:
 - diagnostics export is support-ready
 - benchmark docs cover all dictation modes
 - no migration surprises remain for existing settings files
+- settings health reports loaded schema, current schema, and migration notes
 
 ### `0.1.8-dev.5`
 
@@ -43,6 +45,7 @@ Goal:
 
 Required work:
 - smoke-test onboarding, guided tune, profile import/export, correction promotion, diagnostics export, updater settings, tray behavior, and single-instance handling
+- smoke-test path normalization and duplicate validation for imported profiles/corrections
 - resolve any regressions found from `dev.4`
 - confirm release workflow behavior is acceptable for the public cut
 - freeze scope
@@ -64,6 +67,7 @@ Before tagging `v0.1.8`, verify all of the following:
 - packaged installer builds successfully
 - updater path works from the previous public installer
 - diagnostics export writes a file and includes active context plus correction diagnostics
+- diagnostics export includes settings schema health and migration notes
 - no orphaned correction rules remain in the default test profile set
 - release workflow signing behavior is explicitly accepted for the chosen release path
 
@@ -75,7 +79,7 @@ Before tagging `v0.1.8`, verify all of the following:
 
 ## Recommended Next Actions
 
-1. Build and package `0.1.8-dev.3`.
-2. Use `dev.4` for diagnostics, benchmark, and migration hardening only.
-3. Use `dev.5` for stabilization and release gating only.
+1. Use `dev.4` for diagnostics, benchmark, migration, and import/export hardening only.
+2. Use `dev.5` for stabilization and release gating only.
+3. Keep the smoke harness aligned with real validation blockers rather than renderer-only happy paths.
 4. Tag public `v0.1.8` only after `dev.5` passes the release checklist end to end.

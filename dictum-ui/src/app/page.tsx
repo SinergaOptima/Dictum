@@ -1102,6 +1102,7 @@ export default function Home() {
   const duplicateFinalSuppressed = perfSnapshot?.diagnostics.duplicateFinalSuppressed ?? 0;
   const partialRescuesUsed = perfSnapshot?.diagnostics.partialRescuesUsed ?? 0;
   const correctionDiagnostics = diagnosticsBundle?.correctionDiagnostics ?? null;
+  const settingsHealth = diagnosticsBundle?.settingsHealth ?? null;
   const currentContextRuleCount = correctionHealthSummary.currentContextRules;
   const readinessItems = useMemo(
     () => [
@@ -1141,6 +1142,18 @@ export default function Home() {
         detail: `${currentContextRuleCount} rules match the current context. ${correctionHealthSummary.orphanedProfileRules} orphaned, ${correctionHealthSummary.staleRules} stale.`,
       },
       {
+        label: "Settings health",
+        value: settingsHealth
+          ? `Schema v${settingsHealth.currentSchemaVersion}`
+          : "Not inspected yet",
+        ok: !!settingsHealth,
+        detail: settingsHealth
+          ? settingsHealth.migrationNotes.length > 0
+            ? settingsHealth.migrationNotes.join(" ")
+            : `Loaded schema v${settingsHealth.loadedSchemaVersion}. No migration notes were recorded.`
+          : "Refresh diagnostics to inspect settings schema and migration notes.",
+      },
+      {
         label: "Diagnostics export",
         value: lastDiagnosticsExportPath ? "Exported" : "Not exported yet",
         ok: !!lastDiagnosticsExportPath,
@@ -1164,6 +1177,7 @@ export default function Home() {
       learnedCorrections.length,
       modelProfile,
       modelRecommendation,
+      settingsHealth,
       updateInfo?.hasUpdate,
       updateInfo?.latestVersion,
       updateRepoSlug,
@@ -1706,6 +1720,41 @@ export default function Home() {
                             <p className="settings-note">No corrections have been used in live dictation yet.</p>
                           )}
                         </div>
+                      </div>
+                    </article>
+                  </div>
+                  )}
+                  {settingsHealth && (
+                  <div className="settings-stack">
+                    <article className="settings-card">
+                      <div className="settings-card-header">
+                        <h3>Settings Health</h3>
+                        <p>Schema and migration visibility for the local settings file used by this install.</p>
+                      </div>
+                      <div className="panel-grid">
+                        <div className="stat-card">
+                          <b>v{settingsHealth.loadedSchemaVersion}</b><span>Loaded Schema</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>v{settingsHealth.currentSchemaVersion}</b><span>Current Schema</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{settingsHealth.migrationApplied ? "yes" : "no"}</b><span>Migration Applied</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{settingsHealth.migrationNotes.length}</b><span>Migration Notes</span>
+                        </div>
+                      </div>
+                      <div className="panel-list">
+                        {settingsHealth.migrationNotes.length > 0 ? (
+                          settingsHealth.migrationNotes.map((note) => (
+                            <article key={note} className="panel-card">
+                              <p>{note}</p>
+                            </article>
+                          ))
+                        ) : (
+                          <p className="settings-note">No settings migration notes were recorded for this load.</p>
+                        )}
                       </div>
                     </article>
                   </div>
