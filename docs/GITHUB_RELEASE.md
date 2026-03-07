@@ -38,6 +38,8 @@ If these are not present, release artifacts are built but not Authenticode-signe
 
 ## 3) Trigger release
 
+Internal dev builds should use prerelease versions such as `0.1.8-dev.1` through `0.1.8-dev.5` and should not be tagged or published to GitHub Releases unless explicitly intended as a prerelease artifact.
+
 Option A: Push a version tag (auto release upload):
 
 ```powershell
@@ -57,6 +59,40 @@ The workflow generates and uploads:
 
 On tag builds, these are attached to the GitHub Release automatically.
 
+## 4.1) Writing release notes
+
+Do not pass release notes to `gh release create` or `gh release edit` as a single escaped string containing `\n`.
+GitHub will render those literal backslash characters instead of real line breaks.
+
+Prefer one of these approaches:
+
+```powershell
+$notes = @'
+Public 0.1.8 release.
+
+## Highlights
+- item one
+- item two
+'@
+Set-Content .tmp-release-notes.md $notes
+gh release edit v0.1.8 --notes-file .tmp-release-notes.md
+```
+
+or:
+
+```powershell
+$notes = @'
+Public 0.1.8 release.
+
+## Highlights
+- item one
+- item two
+'@
+gh release create v0.1.8 ... --notes-file .tmp-release-notes.md
+```
+
+If using the second pattern, write the here-string to a file first. `--notes-file` is the safest path.
+
 ## 5) Pre-release checklist for Dictum
 
 Before cutting a public release, verify all of the following locally or in CI:
@@ -69,6 +105,9 @@ Before cutting a public release, verify all of the following locally or in CI:
 - the updater default repo slug is `sinergaoptima/dictum` in both frontend and backend
 - `SHA256SUMS.txt` contains entries for both the installer and `dictum.exe`
 - the installer passes Authenticode verification after build
+- the workflow verifies signatures with `signtool verify`, not only `Get-AuthenticodeSignature`
+- if the signing cert is private or self-signed, its public cert is imported into the runner's current-user trust stores before verification
+- the signing step is time-bounded and retries across multiple timestamp servers instead of waiting indefinitely on one TSA
 
 ## 6) Updater smoke test checklist
 
@@ -87,3 +126,5 @@ Run these from the previous public installer, not only from a local dev build:
 - Use a canary release or manual workflow run after any signing workflow change.
 - Treat unexpected workflow warnings as release blockers until they are understood or explicitly waived.
 - Keep rollback notes for at least one previous public version in the GitHub release body.
+- Prefer `signtool verify /pa` as the release gate; use `Get-AuthenticodeSignature` mainly for signer metadata inspection.
+- Keep signing and verification steps explicitly time-bounded so runner-side TSA or trust-store issues fail fast.

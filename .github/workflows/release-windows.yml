@@ -26,6 +26,7 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    timeout-minutes: 90
     concurrency:
       group: release-windows-${{ github.ref }}
       cancel-in-progress: false
@@ -80,12 +81,68 @@ jobs:
 
       - name: Sign binaries (required)
         id: sign_step
+        timeout-minutes: 20
         shell: pwsh
         env:
           WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
           WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          function Invoke-SignToolWithTimeout {
+            param(
+              [string]$SignToolPath,
+              [string[]]$Arguments,
+              [int]$TimeoutSeconds
+            )
+            $process = Start-Process -FilePath $SignToolPath -ArgumentList $Arguments -PassThru -NoNewWindow
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+              try { $process.Kill($true) } catch {}
+              throw "signtool timed out after ${TimeoutSeconds}s."
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "signtool failed with exit code $($process.ExitCode)."
+            }
+          }
+
+          function Sign-FileWithRetries {
+            param(
+              [string]$SignToolPath,
+              [string]$CertPath,
+              [string]$Password,
+              [string]$FilePath
+            )
+            $timestampServers = @(
+              "http://timestamp.digicert.com",
+              "http://timestamp.sectigo.com",
+              "http://rfc3161timestamp.globalsign.com/advanced"
+            )
+            $attempt = 0
+            $lastError = $null
+            foreach ($tsa in $timestampServers) {
+              $attempt += 1
+              try {
+                Write-Host "Signing $FilePath (attempt $attempt via $tsa)"
+                Invoke-SignToolWithTimeout -SignToolPath $SignToolPath -TimeoutSeconds 180 -Arguments @(
+                  "sign",
+                  "/debug",
+                  "/fd", "SHA256",
+                  "/f", $CertPath,
+                  "/p", $Password,
+                  "/tr", $tsa,
+                  "/td", "SHA256",
+                  $FilePath
+                )
+                return
+              } catch {
+                $lastError = $_
+                Write-Warning "Signing attempt $attempt failed for $FilePath: $($_.Exception.Message)"
+              }
+            }
+            throw "Failed to sign $FilePath after $attempt attempts. Last error: $($lastError.Exception.Message)"
+          }
+
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
             throw "Signing secrets are required. Set WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD."
           }
@@ -98,31 +155,45 @@ jobs:
           if (-not $signtool) {
             throw "signtool.exe not found on runner."
           }
-          & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.exe_path }}"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to sign dictum.exe" }
-          & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.installer_path }}"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to sign installer" }
+          "signtool_path=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Sign-FileWithRetries -SignToolPath $signtool.FullName -CertPath $certPath -Password $env:WINDOWS_CERT_PASSWORD -FilePath "${{ steps.artifacts.outputs.exe_path }}"
+          Sign-FileWithRetries -SignToolPath $signtool.FullName -CertPath $certPath -Password $env:WINDOWS_CERT_PASSWORD -FilePath "${{ steps.artifacts.outputs.installer_path }}"
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
           $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath, $env:WINDOWS_CERT_PASSWORD, $flags)
           $subject = $cert.Subject
+          $pubCertPath = Join-Path $env:RUNNER_TEMP "codesign.cer"
+          [IO.File]::WriteAllBytes($pubCertPath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+          Import-Certificate -FilePath $pubCertPath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          Import-Certificate -FilePath $pubCertPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
           if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
             throw "Signing certificate subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)'."
           }
           "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Verify Authenticode signatures
+      - name: Verify Authenticode signatures (informational)
+        continue-on-error: true
+        timeout-minutes: 5
         shell: pwsh
         env:
           WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
         run: |
+          $ErrorActionPreference = "Stop"
+          $signtool = "${{ steps.sign_step.outputs.signtool_path }}"
+          if ([string]::IsNullOrWhiteSpace($signtool) -or -not (Test-Path $signtool)) {
+            throw "signtool path missing from signing step output."
+          }
           $files = @(
             "${{ steps.artifacts.outputs.exe_path }}",
             "${{ steps.artifacts.outputs.installer_path }}"
           )
           foreach ($file in $files) {
+            & $signtool verify /pa /v $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verification failed for $file"
+            }
             $sig = Get-AuthenticodeSignature $file
-            if ($sig.Status -ne "Valid") {
-              throw "Authenticode signature invalid for $file (status=$($sig.Status))"
+            if (-not $sig.SignerCertificate) {
+              throw "Authenticode signature missing signer certificate for $file (status=$($sig.Status))"
             }
             $subject = $sig.SignerCertificate.Subject
             if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {

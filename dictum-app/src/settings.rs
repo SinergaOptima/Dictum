@@ -6,21 +6,43 @@ use std::path::{Path, PathBuf};
 use dictum_core::{engine::EngineConfig, DictumEngine};
 use serde::{Deserialize, Serialize};
 
+pub const CURRENT_SETTINGS_SCHEMA_VERSION: usize = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LearnedCorrection {
     pub heard: String,
     pub corrected: String,
     pub hits: usize,
+    #[serde(default)]
+    pub mode_affinity: Option<String>,
+    #[serde(default)]
+    pub app_profile_affinity: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppProfile {
+    pub id: String,
+    pub name: String,
+    pub app_match: String,
+    pub dictation_mode: String,
+    pub phrase_bias_terms: Vec<String>,
+    pub post_utterance_refine: bool,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct AppSettings {
+    pub settings_schema_version: usize,
     pub preferred_input_device: Option<String>,
     pub model_profile: String,
     pub performance_profile: String,
+    pub dictation_mode: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
     pub ort_intra_threads: usize,
@@ -42,14 +64,23 @@ pub struct AppSettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub learned_corrections: Vec<LearnedCorrection>,
+    pub app_profiles: Vec<AppProfile>,
+    #[serde(skip)]
+    pub loaded_schema_version: usize,
+    #[serde(skip)]
+    pub migration_applied: bool,
+    #[serde(skip)]
+    pub migration_notes: Vec<String>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            settings_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
             preferred_input_device: None,
             model_profile: "distil-large-v3".into(),
             performance_profile: "whisper_balanced_english".into(),
+            dictation_mode: "conversation".into(),
             toggle_shortcut: "Ctrl+Shift+Space".into(),
             ort_ep: "auto".into(),
             ort_intra_threads: 0,
@@ -71,8 +102,21 @@ impl Default for AppSettings {
             history_enabled: true,
             retention_days: 90,
             learned_corrections: Vec::new(),
+            app_profiles: Vec::new(),
+            loaded_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
+            migration_applied: false,
+            migration_notes: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsHealth {
+    pub loaded_schema_version: usize,
+    pub current_schema_version: usize,
+    pub migration_applied: bool,
+    pub migration_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +124,7 @@ impl Default for AppSettings {
 pub struct RuntimeSettings {
     pub model_profile: String,
     pub performance_profile: String,
+    pub dictation_mode: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
     pub ort_intra_threads: usize,
@@ -101,6 +146,7 @@ pub struct RuntimeSettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub correction_count: usize,
+    pub app_profile_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -111,8 +157,10 @@ pub enum RuntimeEnvMode {
 
 impl AppSettings {
     pub fn normalize(&mut self) {
+        self.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
         self.model_profile = normalize_model_profile(&self.model_profile);
         self.performance_profile = normalize_performance_profile(&self.performance_profile);
+        self.dictation_mode = normalize_dictation_mode(&self.dictation_mode);
         self.toggle_shortcut = normalize_toggle_shortcut(&self.toggle_shortcut);
         self.ort_ep = normalize_ort_ep(&self.ort_ep);
         self.ort_intra_threads = self.ort_intra_threads.clamp(0, 32);
@@ -147,6 +195,7 @@ impl AppSettings {
         }
         self.retention_days = self.retention_days.clamp(1, 3650);
         self.learned_corrections = normalize_learned_corrections(&self.learned_corrections);
+        self.app_profiles = normalize_app_profiles(&self.app_profiles);
         self.preferred_input_device = self
             .preferred_input_device
             .as_ref()
@@ -154,10 +203,24 @@ impl AppSettings {
             .filter(|d| !d.is_empty());
     }
 
+    pub fn settings_health(&self) -> SettingsHealth {
+        SettingsHealth {
+            loaded_schema_version: self.loaded_schema_version,
+            current_schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
+            migration_applied: self.migration_applied,
+            migration_notes: self.migration_notes.clone(),
+        }
+    }
+
+    pub fn needs_persist_after_load(&self) -> bool {
+        self.migration_applied
+    }
+
     pub fn runtime_settings(&self) -> RuntimeSettings {
         RuntimeSettings {
             model_profile: self.model_profile.clone(),
             performance_profile: self.performance_profile.clone(),
+            dictation_mode: self.dictation_mode.clone(),
             toggle_shortcut: self.toggle_shortcut.clone(),
             ort_ep: self.ort_ep.clone(),
             ort_intra_threads: self.ort_intra_threads,
@@ -179,6 +242,7 @@ impl AppSettings {
             history_enabled: self.history_enabled,
             retention_days: self.retention_days,
             correction_count: self.learned_corrections.len(),
+            app_profile_count: self.app_profiles.len(),
         }
     }
 }
@@ -257,6 +321,106 @@ pub fn normalize_performance_profile(raw: &str) -> String {
     }
 }
 
+pub fn normalize_dictation_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "coding" | "code" => "coding".into(),
+        "command" | "commands" => "command".into(),
+        _ => "conversation".into(),
+    }
+}
+
+fn normalize_executable_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let basename = trimmed
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_lowercase();
+    if basename.is_empty() {
+        return None;
+    }
+    if basename.ends_with(".exe") {
+        return Some(basename);
+    }
+    if !basename.contains('.') {
+        return Some(format!("{basename}.exe"));
+    }
+    None
+}
+
+fn normalize_app_profiles(profiles: &[AppProfile]) -> Vec<AppProfile> {
+    let mut out = Vec::new();
+    for profile in profiles {
+        let id = profile.id.trim().to_string();
+        let name = profile.name.trim().to_string();
+        let Some(app_match) = normalize_executable_name(&profile.app_match) else {
+            continue;
+        };
+        if id.is_empty() || name.is_empty() || app_match.is_empty() {
+            continue;
+        }
+        out.push(AppProfile {
+            id,
+            name,
+            app_match,
+            dictation_mode: normalize_dictation_mode(&profile.dictation_mode),
+            phrase_bias_terms: normalize_phrase_bias_terms(&profile.phrase_bias_terms),
+            post_utterance_refine: profile.post_utterance_refine,
+            enabled: profile.enabled,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.app_match.cmp(&b.app_match))
+    });
+    out
+}
+
+pub fn resolve_app_profile<'a>(
+    settings: &'a AppSettings,
+    foreground_app: Option<&str>,
+) -> Option<&'a AppProfile> {
+    let Some(app) = foreground_app.and_then(normalize_executable_name) else {
+        return None;
+    };
+    settings
+        .app_profiles
+        .iter()
+        .find(|profile| profile.enabled && profile.app_match == app)
+}
+
+pub fn apply_runtime_env_with_profile(
+    settings: &AppSettings,
+    profile: Option<&AppProfile>,
+    mode: RuntimeEnvMode,
+) {
+    apply_runtime_env_from_settings(settings, mode);
+    if let Some(profile) = profile {
+        set_runtime_var(
+            "DICTUM_POST_UTTERANCE_REFINEMENT",
+            Some(
+                if profile.post_utterance_refine {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            ),
+            RuntimeEnvMode::Overwrite,
+        );
+        set_runtime_var(
+            "DICTUM_PHRASE_BIAS_TERMS",
+            Some(profile.phrase_bias_terms.join("\n")),
+            RuntimeEnvMode::Overwrite,
+        );
+    }
+}
+
 pub fn normalize_toggle_shortcut(raw: &str) -> String {
     let normalized = raw.trim();
     if normalized.is_empty() {
@@ -321,7 +485,10 @@ fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrec
             continue;
         }
         if out.iter().any(|e: &LearnedCorrection| {
-            e.heard.eq_ignore_ascii_case(&heard) && e.corrected.eq_ignore_ascii_case(&corrected)
+            e.heard.eq_ignore_ascii_case(&heard)
+                && e.corrected.eq_ignore_ascii_case(&corrected)
+                && e.mode_affinity == item.mode_affinity
+                && e.app_profile_affinity == item.app_profile_affinity
         }) {
             continue;
         }
@@ -329,11 +496,32 @@ fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrec
             heard,
             corrected,
             hits: item.hits.clamp(1, 1_000_000),
+            mode_affinity: item
+                .mode_affinity
+                .as_ref()
+                .map(|value| normalize_dictation_mode(value))
+                .filter(|value| !value.is_empty()),
+            app_profile_affinity: item
+                .app_profile_affinity
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            last_used_at: item
+                .last_used_at
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         });
         if out.len() >= 256 {
             break;
         }
     }
+    out.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
     out
 }
 
@@ -346,6 +534,169 @@ fn set_runtime_var(name: &str, value: Option<String>, mode: RuntimeEnvMode) {
         Some(value) => std::env::set_var(name, value),
         None if mode == RuntimeEnvMode::Overwrite => std::env::remove_var(name),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        load_settings, normalize_app_profiles, normalize_learned_corrections, resolve_app_profile,
+        AppProfile, AppSettings, LearnedCorrection, CURRENT_SETTINGS_SCHEMA_VERSION,
+    };
+    use std::fs;
+
+    #[test]
+    fn normalize_learned_corrections_keeps_distinct_context_variants() {
+        let normalized = normalize_learned_corrections(&[
+            LearnedCorrection {
+                heard: "printf".into(),
+                corrected: "println!".into(),
+                hits: 1,
+                mode_affinity: Some("coding".into()),
+                app_profile_affinity: None,
+                last_used_at: Some("2026-03-07T10:00:00Z".into()),
+            },
+            LearnedCorrection {
+                heard: "printf".into(),
+                corrected: "println!".into(),
+                hits: 1,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: None,
+                last_used_at: Some("2026-03-07T11:00:00Z".into()),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn normalize_learned_corrections_deduplicates_same_context_rule() {
+        let normalized = normalize_learned_corrections(&[
+            LearnedCorrection {
+                heard: "ladder labs".into(),
+                corrected: "Lattice Labs".into(),
+                hits: 1,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: Some("slack-profile".into()),
+                last_used_at: Some("2026-03-07T10:00:00Z".into()),
+            },
+            LearnedCorrection {
+                heard: "LADDER LABS".into(),
+                corrected: "Lattice Labs".into(),
+                hits: 5,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: Some("slack-profile".into()),
+                last_used_at: Some("2026-03-07T11:00:00Z".into()),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].heard, "ladder labs");
+        assert_eq!(normalized[0].mode_affinity.as_deref(), Some("conversation"));
+        assert_eq!(
+            normalized[0].app_profile_affinity.as_deref(),
+            Some("slack-profile")
+        );
+    }
+
+    #[test]
+    fn normalize_app_profiles_reduces_windows_paths_to_executable_name() {
+        let normalized = normalize_app_profiles(&[AppProfile {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_match: r#""C:\Program Files\Cursor\Cursor.exe""#.into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: vec!["TypeScript".into()],
+            post_utterance_refine: true,
+            enabled: true,
+        }]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].app_match, "cursor.exe");
+    }
+
+    #[test]
+    fn resolve_app_profile_matches_normalized_foreground_basename() {
+        let mut settings = AppSettings::default();
+        settings.app_profiles = vec![AppProfile {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_match: "cursor.exe".into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: Vec::new(),
+            post_utterance_refine: false,
+            enabled: true,
+        }];
+        settings.normalize();
+
+        let matched = resolve_app_profile(
+            &settings,
+            Some(r"C:\Program Files\Cursor\resources\app\Cursor.exe"),
+        )
+        .expect("profile match");
+        assert_eq!(matched.id, "cursor");
+    }
+
+    #[test]
+    fn resolve_app_profile_does_not_match_partial_substrings() {
+        let mut settings = AppSettings::default();
+        settings.app_profiles = vec![AppProfile {
+            id: "code".into(),
+            name: "VS Code".into(),
+            app_match: "code.exe".into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: Vec::new(),
+            post_utterance_refine: false,
+            enabled: true,
+        }];
+        settings.normalize();
+
+        assert!(resolve_app_profile(&settings, Some("mycode-helper.exe")).is_none());
+    }
+
+    #[test]
+    fn load_settings_marks_legacy_schema_and_normalization_notes() {
+        let unique = format!(
+            "dictum-settings-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::write(
+            &path,
+            r#"{
+              "dictationMode": "code",
+              "appProfiles": [{
+                "id": "cursor",
+                "name": "Cursor",
+                "appMatch": "C:\\Program Files\\Cursor\\Cursor.exe",
+                "dictationMode": "coding",
+                "phraseBiasTerms": [],
+                "postUtteranceRefine": true,
+                "enabled": true
+              }]
+            }"#,
+        )
+        .expect("write settings fixture");
+
+        let loaded = load_settings(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(loaded.loaded_schema_version, 0);
+        assert_eq!(
+            loaded.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
+        assert!(loaded.migration_applied);
+        assert!(loaded
+            .migration_notes
+            .iter()
+            .any(|note| note.contains("Legacy settings file had no schema version marker.")));
+        assert_eq!(loaded.dictation_mode, "coding");
+        assert_eq!(loaded.app_profiles[0].app_match, "cursor.exe");
     }
 }
 
@@ -464,11 +815,42 @@ pub fn default_settings_path() -> PathBuf {
 }
 
 pub fn load_settings(path: &Path) -> AppSettings {
-    let mut settings = fs::read_to_string(path)
+    let Some(raw) = fs::read_to_string(path).ok() else {
+        return AppSettings::default();
+    };
+
+    let loaded_schema_version = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|raw| serde_json::from_str::<AppSettings>(&raw).ok())
-        .unwrap_or_default();
+        .and_then(|value| {
+            value
+                .get("settingsSchemaVersion")
+                .and_then(|entry| entry.as_u64())
+        })
+        .map(|value| value as usize)
+        .unwrap_or(0);
+
+    let mut settings = serde_json::from_str::<AppSettings>(&raw).unwrap_or_default();
+    let pre_normalize_snapshot = serde_json::to_value(&settings).ok();
     settings.normalize();
+    let post_normalize_snapshot = serde_json::to_value(&settings).ok();
+    settings.loaded_schema_version = loaded_schema_version;
+    settings.migration_applied = loaded_schema_version < CURRENT_SETTINGS_SCHEMA_VERSION
+        || pre_normalize_snapshot != post_normalize_snapshot;
+    if loaded_schema_version == 0 {
+        settings
+            .migration_notes
+            .push("Legacy settings file had no schema version marker.".into());
+    } else if loaded_schema_version < CURRENT_SETTINGS_SCHEMA_VERSION {
+        settings.migration_notes.push(format!(
+            "Settings schema upgraded from v{} to v{}.",
+            loaded_schema_version, CURRENT_SETTINGS_SCHEMA_VERSION
+        ));
+    }
+    if pre_normalize_snapshot != post_normalize_snapshot {
+        settings
+            .migration_notes
+            .push("Settings values were normalized on load to match current app rules.".into());
+    }
     settings
 }
 

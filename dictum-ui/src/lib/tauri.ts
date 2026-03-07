@@ -22,12 +22,16 @@ import type {
   StatsPayload,
   PerfSnapshot,
   DiagnosticsBundle,
+  DiagnosticsExportResult,
   ModelProfileMetadata,
   ModelProfileRecommendation,
   AutoTuneResult,
   BenchmarkAutoTuneResult,
   AppUpdateInfo,
+  AppProfile,
+  ActiveAppContext,
   LearnedCorrection,
+  CorrectionPruneResult,
 } from "@shared/ipc_types";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +117,7 @@ export const downloadAndInstallAppUpdate = (
 export const setRuntimeSettings = (
   modelProfile?: string | null,
   performanceProfile?: string | null,
+  dictationMode?: string | null,
   toggleShortcut?: string | null,
   ortEp?: string | null,
   ortIntraThreads?: number | null,
@@ -137,6 +142,7 @@ export const setRuntimeSettings = (
   tauriInvoke("set_runtime_settings", {
     modelProfile: modelProfile ?? null,
     performanceProfile: performanceProfile ?? null,
+    dictationMode: dictationMode ?? null,
     toggleShortcut: toggleShortcut ?? null,
     ortEp: ortEp ?? null,
     ortIntraThreads: ortIntraThreads ?? null,
@@ -164,6 +170,9 @@ export const getPerfSnapshot = (): Promise<PerfSnapshot> =>
 
 export const getDiagnosticsBundle = (): Promise<DiagnosticsBundle> =>
   tauriInvoke("get_diagnostics_bundle");
+
+export const exportDiagnosticsBundle = (): Promise<DiagnosticsExportResult> =>
+  tauriInvoke("export_diagnostics_bundle");
 
 export const getPrivacySettings = (): Promise<PrivacySettings> =>
   tauriInvoke("get_privacy_settings");
@@ -230,20 +239,51 @@ export const getLearnedCorrections = (): Promise<LearnedCorrection[]> =>
 export const learnCorrection = (
   heard: string,
   corrected: string,
+  modeAffinity?: string | null,
+  appProfileAffinity?: string | null,
 ): Promise<LearnedCorrection[]> =>
   tauriInvoke("learn_correction", {
     heard,
     corrected,
+    modeAffinity: modeAffinity ?? null,
+    appProfileAffinity: appProfileAffinity ?? null,
   });
 
 export const deleteLearnedCorrection = (
   heard: string,
   corrected?: string | null,
+  modeAffinity?: string | null,
+  appProfileAffinity?: string | null,
 ): Promise<LearnedCorrection[]> =>
   tauriInvoke("delete_learned_correction", {
     heard,
     corrected: corrected ?? null,
+    modeAffinity: modeAffinity ?? null,
+    appProfileAffinity: appProfileAffinity ?? null,
   });
+
+export const pruneLearnedCorrections = (
+  removeUnused?: boolean | null,
+  removeOrphanedProfiles?: boolean | null,
+  removeStale?: boolean | null,
+): Promise<CorrectionPruneResult> =>
+  tauriInvoke("prune_learned_corrections", {
+    removeUnused: removeUnused ?? null,
+    removeOrphanedProfiles: removeOrphanedProfiles ?? null,
+    removeStale: removeStale ?? null,
+  });
+
+export const getAppProfiles = (): Promise<AppProfile[]> =>
+  tauriInvoke("get_app_profiles");
+
+export const upsertAppProfile = (profile: AppProfile): Promise<AppProfile[]> =>
+  tauriInvoke("upsert_app_profile", { profile });
+
+export const deleteAppProfile = (id: string): Promise<AppProfile[]> =>
+  tauriInvoke("delete_app_profile", { id });
+
+export const getActiveAppContext = (): Promise<ActiveAppContext> =>
+  tauriInvoke("get_active_app_context");
 
 // ---------------------------------------------------------------------------
 // Event listeners

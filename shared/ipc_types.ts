@@ -131,6 +131,8 @@ export interface RuntimeSettings {
     | "stability_long_form"
     | "balanced_general"
     | "latency_short_utterance";
+  /** Post-processing mode for final dictated text. */
+  dictationMode: "conversation" | "coding" | "command";
   /** Global push-to-talk toggle shortcut. */
   toggleShortcut: string;
   /** ONNX execution provider preference: "auto" | "cpu" | "directml". */
@@ -173,6 +175,27 @@ export interface RuntimeSettings {
   retentionDays: number;
   /** Number of learned correction rules. */
   correctionCount: number;
+  /** Number of configured per-app profiles. */
+  appProfileCount: number;
+}
+
+export interface AppProfile {
+  id: string;
+  name: string;
+  appMatch: string;
+  dictationMode: "conversation" | "coding" | "command";
+  phraseBiasTerms: string[];
+  postUtteranceRefine: boolean;
+  enabled: boolean;
+}
+
+export interface ActiveAppContext {
+  foregroundApp: string | null;
+  matchedProfileId: string | null;
+  matchedProfileName: string | null;
+  dictationMode: "conversation" | "coding" | "command" | string;
+  phraseBiasTermCount: number;
+  postUtteranceRefine: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +259,16 @@ export interface LearnedCorrection {
   heard: string;
   corrected: string;
   hits: number;
+  modeAffinity?: "conversation" | "coding" | "command" | string | null;
+  appProfileAffinity?: string | null;
+  lastUsedAt?: string | null;
+}
+
+export interface CorrectionPruneResult {
+  rules: LearnedCorrection[];
+  removedUnused: number;
+  removedOrphanedProfiles: number;
+  removedStale: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +386,13 @@ export interface DiagnosticsBundle {
   appVersion: string;
   updateRepoSlug: string;
   settingsPath: string;
+  settingsHealth: {
+    loadedSchemaVersion: number;
+    currentSchemaVersion: number;
+    migrationApplied: boolean;
+    migrationNotes: string[];
+  };
+  activeAppContext: ActiveAppContext;
   runtimeSettings: RuntimeSettings;
   privacySettings: PrivacySettings;
   perfSnapshot: PerfSnapshot;
@@ -363,4 +403,36 @@ export interface DiagnosticsBundle {
     newestCreatedAt: string | null;
   };
   devices: DeviceInfo[];
+  correctionDiagnostics: {
+    totalRules: number;
+    globalRules: number;
+    modeScopedRules: number;
+    profileScopedRules: number;
+    unusedRules: number;
+    orphanedProfileRules: number;
+    staleRules: number;
+    topRules: Array<{
+      heard: string;
+      corrected: string;
+      hits: number;
+      modeAffinity?: string | null;
+      appProfileAffinity?: string | null;
+      appProfileName?: string | null;
+      lastUsedAt?: string | null;
+    }>;
+    recentRules: Array<{
+      heard: string;
+      corrected: string;
+      hits: number;
+      modeAffinity?: string | null;
+      appProfileAffinity?: string | null;
+      appProfileName?: string | null;
+      lastUsedAt?: string | null;
+    }>;
+  };
+}
+
+export interface DiagnosticsExportResult {
+  path: string;
+  fileName: string;
 }
