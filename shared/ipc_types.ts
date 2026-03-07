@@ -259,6 +259,9 @@ export interface LearnedCorrection {
   heard: string;
   corrected: string;
   hits: number;
+  modeAffinity?: "conversation" | "coding" | "command" | string | null;
+  appProfileAffinity?: string | null;
+  lastUsedAt?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +379,7 @@ export interface DiagnosticsBundle {
   appVersion: string;
   updateRepoSlug: string;
   settingsPath: string;
+  activeAppContext: ActiveAppContext;
   runtimeSettings: RuntimeSettings;
   privacySettings: PrivacySettings;
   perfSnapshot: PerfSnapshot;
@@ -386,4 +390,34 @@ export interface DiagnosticsBundle {
     newestCreatedAt: string | null;
   };
   devices: DeviceInfo[];
+  correctionDiagnostics: {
+    totalRules: number;
+    globalRules: number;
+    modeScopedRules: number;
+    profileScopedRules: number;
+    unusedRules: number;
+    topRules: Array<{
+      heard: string;
+      corrected: string;
+      hits: number;
+      modeAffinity?: string | null;
+      appProfileAffinity?: string | null;
+      appProfileName?: string | null;
+      lastUsedAt?: string | null;
+    }>;
+    recentRules: Array<{
+      heard: string;
+      corrected: string;
+      hits: number;
+      modeAffinity?: string | null;
+      appProfileAffinity?: string | null;
+      appProfileName?: string | null;
+      lastUsedAt?: string | null;
+    }>;
+  };
+}
+
+export interface DiagnosticsExportResult {
+  path: string;
+  fileName: string;
 }

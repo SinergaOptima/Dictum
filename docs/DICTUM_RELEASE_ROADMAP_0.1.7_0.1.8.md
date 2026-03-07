@@ -56,6 +56,7 @@ Improve recognition usefulness for real workflows by making dictation behavior c
 - `0.1.8` will ship through five internal dev builds before the public release:
   - `0.1.8-dev.1`
   - `0.1.8-dev.2`
+  - `0.1.8-dev.2`
   - `0.1.8-dev.3`
   - `0.1.8-dev.4`
   - `0.1.8-dev.5`
@@ -97,7 +98,7 @@ Improve recognition usefulness for real workflows by making dictation behavior c
 
 ### Current Dev Status
 
-`0.1.8-dev.1` currently includes:
+`0.1.8-dev.2` currently includes:
 
 - guided onboarding tuning
 - dictation modes

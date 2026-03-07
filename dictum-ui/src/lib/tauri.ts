@@ -22,6 +22,7 @@ import type {
   StatsPayload,
   PerfSnapshot,
   DiagnosticsBundle,
+  DiagnosticsExportResult,
   ModelProfileMetadata,
   ModelProfileRecommendation,
   AutoTuneResult,
@@ -169,6 +170,9 @@ export const getPerfSnapshot = (): Promise<PerfSnapshot> =>
 export const getDiagnosticsBundle = (): Promise<DiagnosticsBundle> =>
   tauriInvoke("get_diagnostics_bundle");
 
+export const exportDiagnosticsBundle = (): Promise<DiagnosticsExportResult> =>
+  tauriInvoke("export_diagnostics_bundle");
+
 export const getPrivacySettings = (): Promise<PrivacySettings> =>
   tauriInvoke("get_privacy_settings");
 
@@ -234,19 +238,27 @@ export const getLearnedCorrections = (): Promise<LearnedCorrection[]> =>
 export const learnCorrection = (
   heard: string,
   corrected: string,
+  modeAffinity?: string | null,
+  appProfileAffinity?: string | null,
 ): Promise<LearnedCorrection[]> =>
   tauriInvoke("learn_correction", {
     heard,
     corrected,
+    modeAffinity: modeAffinity ?? null,
+    appProfileAffinity: appProfileAffinity ?? null,
   });
 
 export const deleteLearnedCorrection = (
   heard: string,
   corrected?: string | null,
+  modeAffinity?: string | null,
+  appProfileAffinity?: string | null,
 ): Promise<LearnedCorrection[]> =>
   tauriInvoke("delete_learned_correction", {
     heard,
     corrected: corrected ?? null,
+    modeAffinity: modeAffinity ?? null,
+    appProfileAffinity: appProfileAffinity ?? null,
   });
 
 export const getAppProfiles = (): Promise<AppProfile[]> =>

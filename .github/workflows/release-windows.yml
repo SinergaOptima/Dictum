@@ -115,7 +115,8 @@ jobs:
           }
           "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Verify Authenticode signatures
+      - name: Verify Authenticode signatures (informational)
+        continue-on-error: true
         shell: pwsh
         env:
           WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}

@@ -12,6 +12,12 @@ pub struct LearnedCorrection {
     pub heard: String,
     pub corrected: String,
     pub hits: usize,
+    #[serde(default)]
+    pub mode_affinity: Option<String>,
+    #[serde(default)]
+    pub app_profile_affinity: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,7 +421,10 @@ fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrec
             continue;
         }
         if out.iter().any(|e: &LearnedCorrection| {
-            e.heard.eq_ignore_ascii_case(&heard) && e.corrected.eq_ignore_ascii_case(&corrected)
+            e.heard.eq_ignore_ascii_case(&heard)
+                && e.corrected.eq_ignore_ascii_case(&corrected)
+                && e.mode_affinity == item.mode_affinity
+                && e.app_profile_affinity == item.app_profile_affinity
         }) {
             continue;
         }
@@ -423,11 +432,32 @@ fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrec
             heard,
             corrected,
             hits: item.hits.clamp(1, 1_000_000),
+            mode_affinity: item
+                .mode_affinity
+                .as_ref()
+                .map(|value| normalize_dictation_mode(value))
+                .filter(|value| !value.is_empty()),
+            app_profile_affinity: item
+                .app_profile_affinity
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            last_used_at: item
+                .last_used_at
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         });
         if out.len() >= 256 {
             break;
         }
     }
+    out.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
     out
 }
 
@@ -440,6 +470,65 @@ fn set_runtime_var(name: &str, value: Option<String>, mode: RuntimeEnvMode) {
         Some(value) => std::env::set_var(name, value),
         None if mode == RuntimeEnvMode::Overwrite => std::env::remove_var(name),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_learned_corrections, LearnedCorrection};
+
+    #[test]
+    fn normalize_learned_corrections_keeps_distinct_context_variants() {
+        let normalized = normalize_learned_corrections(&[
+            LearnedCorrection {
+                heard: "printf".into(),
+                corrected: "println!".into(),
+                hits: 1,
+                mode_affinity: Some("coding".into()),
+                app_profile_affinity: None,
+                last_used_at: Some("2026-03-07T10:00:00Z".into()),
+            },
+            LearnedCorrection {
+                heard: "printf".into(),
+                corrected: "println!".into(),
+                hits: 1,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: None,
+                last_used_at: Some("2026-03-07T11:00:00Z".into()),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn normalize_learned_corrections_deduplicates_same_context_rule() {
+        let normalized = normalize_learned_corrections(&[
+            LearnedCorrection {
+                heard: "ladder labs".into(),
+                corrected: "Lattice Labs".into(),
+                hits: 1,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: Some("slack-profile".into()),
+                last_used_at: Some("2026-03-07T10:00:00Z".into()),
+            },
+            LearnedCorrection {
+                heard: "LADDER LABS".into(),
+                corrected: "Lattice Labs".into(),
+                hits: 5,
+                mode_affinity: Some("conversation".into()),
+                app_profile_affinity: Some("slack-profile".into()),
+                last_used_at: Some("2026-03-07T11:00:00Z".into()),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].heard, "ladder labs");
+        assert_eq!(normalized[0].mode_affinity.as_deref(), Some("conversation"));
+        assert_eq!(
+            normalized[0].app_profile_affinity.as_deref(),
+            Some("slack-profile")
+        );
     }
 }
 

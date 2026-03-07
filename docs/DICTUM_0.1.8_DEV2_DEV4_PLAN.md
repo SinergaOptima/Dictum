@@ -1,8 +1,8 @@
 # Dictum 0.1.8 Dev Plans 2-4
 
-This document converts the current `0.1.8-dev.1` state into the next three execution steps.
+This document converts the current `0.1.8-dev.2` state into the next three execution steps.
 
-Current `0.1.8-dev.1` baseline:
+Current `0.1.8-dev.2` baseline:
 
 - guided 30-second tuning is integrated into onboarding and Settings
 - dictation modes exist and affect transcript post-processing
@@ -33,7 +33,7 @@ Reduce regression risk by breaking the main Settings/live implementation into sm
   - updater controls
   - history/stats panels where practical
 - keep the visual design stable
-- preserve all current `0.1.8-dev.1` behavior
+- preserve all current `0.1.8-dev.2` behavior
 - improve app profile editing UX:
   - support editing an existing profile, not only add/delete
   - add starter presets for common apps such as:
@@ -200,6 +200,25 @@ Turn the new context-aware feature set into a release-candidate path by strength
 - `npm run build`
 - `npm run typecheck`
 - manual export/import and diagnostics smoke tests
+
+### Dev.5 Stabilization Checklist
+
+- run app-profile import/export smoke tests with:
+  - valid profile array
+  - empty array
+  - invalid `dictationMode`
+  - missing `appMatch`
+- export a diagnostics file from the Stats tab and verify it contains:
+  - active foreground app
+  - matched profile name/id
+  - effective mode
+  - correction diagnostics
+- rerun the smoke benchmark baseline and compare against `benchmarks/baselines/smoke-baseline.json`
+- verify guided tune still works from both onboarding and Settings
+- verify suggestion promotion works for:
+  - global correction save
+  - mode-only correction save
+  - profile-scoped correction save
 
 ## Suggested Sequencing
 

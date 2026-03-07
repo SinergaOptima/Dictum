@@ -6,6 +6,7 @@
 use dictum_core::{audio::device::DeviceInfo, ipc::events::EngineStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
 use tauri::State;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tracing::{info, warn};
@@ -76,11 +77,44 @@ pub struct DiagnosticsBundle {
     pub app_version: String,
     pub update_repo_slug: String,
     pub settings_path: String,
+    pub active_app_context: ActiveAppContext,
     pub runtime_settings: RuntimeSettings,
     pub privacy_settings: PrivacySettings,
     pub perf_snapshot: PerfSnapshot,
     pub history_storage: HistoryStorageSummary,
     pub devices: Vec<DeviceInfo>,
+    pub correction_diagnostics: CorrectionDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsExportResult {
+    pub path: String,
+    pub file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionRuleSummary {
+    pub heard: String,
+    pub corrected: String,
+    pub hits: usize,
+    pub mode_affinity: Option<String>,
+    pub app_profile_affinity: Option<String>,
+    pub app_profile_name: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionDiagnostics {
+    pub total_rules: usize,
+    pub global_rules: usize,
+    pub mode_scoped_rules: usize,
+    pub profile_scoped_rules: usize,
+    pub unused_rules: usize,
+    pub top_rules: Vec<CorrectionRuleSummary>,
+    pub recent_rules: Vec<CorrectionRuleSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -764,9 +798,19 @@ pub async fn learn_correction(
     state: State<'_, AppState>,
     heard: String,
     corrected: String,
+    mode_affinity: Option<String>,
+    app_profile_affinity: Option<String>,
 ) -> Result<Vec<LearnedCorrection>, String> {
     let heard = heard.trim().to_ascii_lowercase();
     let corrected = corrected.trim().to_string();
+    let mode_affinity = mode_affinity
+        .as_ref()
+        .map(|value| crate::settings::normalize_dictation_mode(value))
+        .filter(|value| !value.is_empty());
+    let app_profile_affinity = app_profile_affinity
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     if heard.is_empty() || corrected.is_empty() {
         return Err("Both 'heard' and 'corrected' are required.".into());
     }
@@ -775,20 +819,35 @@ pub async fn learn_correction(
     if let Some(existing) = settings
         .learned_corrections
         .iter_mut()
-        .find(|c| c.heard.eq_ignore_ascii_case(&heard))
+        .find(|c| {
+            c.heard.eq_ignore_ascii_case(&heard)
+                && c.mode_affinity == mode_affinity
+                && c.app_profile_affinity == app_profile_affinity
+        })
     {
         existing.corrected = corrected.clone();
         existing.hits = existing.hits.saturating_add(1);
+        existing.mode_affinity = mode_affinity.clone();
+        existing.app_profile_affinity = app_profile_affinity.clone();
+        existing.last_used_at = Some(chrono::Utc::now().to_rfc3339());
     } else {
         settings.learned_corrections.push(LearnedCorrection {
             heard: heard.clone(),
             corrected: corrected.clone(),
             hits: 1,
+            mode_affinity: mode_affinity.clone(),
+            app_profile_affinity: app_profile_affinity.clone(),
+            last_used_at: Some(chrono::Utc::now().to_rfc3339()),
         });
     }
     settings
         .learned_corrections
-        .sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.heard.cmp(&b.heard)));
+        .sort_by(|a, b| {
+            b.hits
+                .cmp(&a.hits)
+                .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+                .then_with(|| a.heard.cmp(&b.heard))
+        });
     settings.normalize();
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
 
@@ -804,6 +863,8 @@ pub async fn delete_learned_correction(
     state: State<'_, AppState>,
     heard: String,
     corrected: Option<String>,
+    mode_affinity: Option<String>,
+    app_profile_affinity: Option<String>,
 ) -> Result<Vec<LearnedCorrection>, String> {
     let heard = heard.trim().to_ascii_lowercase();
     if heard.is_empty() {
@@ -812,17 +873,23 @@ pub async fn delete_learned_correction(
     let corrected = corrected
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
-
+    let mode_affinity = mode_affinity
+        .as_ref()
+        .map(|value| crate::settings::normalize_dictation_mode(value))
+        .filter(|value| !value.is_empty());
+    let app_profile_affinity = app_profile_affinity
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let mut settings = state.settings.lock();
     settings.learned_corrections.retain(|c| {
-        if !c.heard.eq_ignore_ascii_case(&heard) {
-            return true;
-        }
-        if let Some(ref corr) = corrected {
-            !c.corrected.eq_ignore_ascii_case(corr)
-        } else {
-            false
-        }
+        !correction_matches_delete_target(
+            c,
+            &heard,
+            corrected.as_deref(),
+            mode_affinity.as_deref(),
+            app_profile_affinity.as_deref(),
+        )
     });
     settings.normalize();
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
@@ -831,6 +898,39 @@ pub async fn delete_learned_correction(
     drop(settings);
     *state.learned_corrections.write() = updated.clone();
     Ok(updated)
+}
+
+fn correction_matches_delete_target(
+    correction: &LearnedCorrection,
+    heard: &str,
+    corrected: Option<&str>,
+    mode_affinity: Option<&str>,
+    app_profile_affinity: Option<&str>,
+) -> bool {
+    if !correction.heard.eq_ignore_ascii_case(heard) {
+        return false;
+    }
+    if let Some(corrected) = corrected {
+        if !correction.corrected.eq_ignore_ascii_case(corrected) {
+            return false;
+        }
+    }
+    let scoped_delete = mode_affinity.is_some() || app_profile_affinity.is_some();
+    if let Some(mode_affinity) = mode_affinity {
+        if correction.mode_affinity.as_deref() != Some(mode_affinity) {
+            return false;
+        }
+    } else if scoped_delete && correction.mode_affinity.is_some() {
+        return false;
+    }
+    if let Some(app_profile_affinity) = app_profile_affinity {
+        if correction.app_profile_affinity.as_deref() != Some(app_profile_affinity) {
+            return false;
+        }
+    } else if scoped_delete && correction.app_profile_affinity.is_some() {
+        return false;
+    }
+    true
 }
 
 /// Return configured per-app dictation profiles.
@@ -871,10 +971,14 @@ pub async fn delete_app_profile(
 /// Return the current foreground app and any matched app profile override.
 #[tauri::command]
 pub async fn get_active_app_context(state: State<'_, AppState>) -> Result<ActiveAppContext, String> {
-    let foreground_app = text_injector::foreground_process_name();
     let settings = state.settings.lock();
-    let matched_profile = resolve_app_profile(&settings, foreground_app.as_deref());
-    Ok(ActiveAppContext {
+    Ok(current_active_app_context(&settings))
+}
+
+fn current_active_app_context(settings: &crate::settings::AppSettings) -> ActiveAppContext {
+    let foreground_app = text_injector::foreground_process_name();
+    let matched_profile = resolve_app_profile(settings, foreground_app.as_deref());
+    ActiveAppContext {
         foreground_app,
         matched_profile_id: matched_profile.map(|profile| profile.id.clone()),
         matched_profile_name: matched_profile.map(|profile| profile.name.clone()),
@@ -887,7 +991,7 @@ pub async fn get_active_app_context(state: State<'_, AppState>) -> Result<Active
         post_utterance_refine: matched_profile
             .map(|profile| profile.post_utterance_refine)
             .unwrap_or(settings.post_utterance_refine),
-    })
+    }
 }
 
 /// Persist runtime settings.
@@ -1038,25 +1142,121 @@ pub async fn get_diagnostics_bundle(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DiagnosticsBundle, String> {
-    let runtime_settings = state.settings.lock().runtime_settings();
+    let settings = state.settings.lock();
+    let active_app_context = current_active_app_context(&settings);
+    let runtime_settings = settings.runtime_settings();
     let privacy_settings = PrivacySettings {
         history_enabled: runtime_settings.history_enabled,
         retention_days: runtime_settings.retention_days,
         cloud_opt_in: runtime_settings.cloud_opt_in,
     };
+    let summarize_rule = |rule: &LearnedCorrection| CorrectionRuleSummary {
+            heard: rule.heard.clone(),
+            corrected: rule.corrected.clone(),
+            hits: rule.hits,
+            mode_affinity: rule.mode_affinity.clone(),
+            app_profile_affinity: rule.app_profile_affinity.clone(),
+            app_profile_name: rule.app_profile_affinity.as_ref().and_then(|id| {
+                settings
+                    .app_profiles
+                    .iter()
+                    .find(|profile| profile.id == *id)
+                    .map(|profile| profile.name.clone())
+            }),
+            last_used_at: rule.last_used_at.clone(),
+        };
+    let mut top_rule_refs = settings.learned_corrections.iter().collect::<Vec<_>>();
+    top_rule_refs.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
+    let top_rules = top_rule_refs
+        .into_iter()
+        .take(12)
+        .map(summarize_rule)
+        .collect::<Vec<_>>();
+    let mut recent_rule_refs = settings
+        .learned_corrections
+        .iter()
+        .filter(|rule| rule.last_used_at.is_some())
+        .collect::<Vec<_>>();
+    recent_rule_refs.sort_by(|a, b| {
+        b.last_used_at
+            .cmp(&a.last_used_at)
+            .then_with(|| b.hits.cmp(&a.hits))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
+    let recent_rules = recent_rule_refs
+        .into_iter()
+        .take(8)
+        .map(summarize_rule)
+        .collect::<Vec<_>>();
+    let correction_diagnostics = CorrectionDiagnostics {
+        total_rules: settings.learned_corrections.len(),
+        global_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.mode_affinity.is_none() && rule.app_profile_affinity.is_none())
+            .count(),
+        mode_scoped_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.mode_affinity.is_some() && rule.app_profile_affinity.is_none())
+            .count(),
+        profile_scoped_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.app_profile_affinity.is_some())
+            .count(),
+        unused_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.hits <= 1 && rule.last_used_at.is_none())
+            .count(),
+        top_rules,
+        recent_rules,
+    };
     let update_repo_slug =
         normalize_repo_slug(None).unwrap_or_else(|_| DEFAULT_UPDATE_REPO_SLUG.to_string());
+    drop(settings);
 
     Ok(DiagnosticsBundle {
         generated_at: chrono::Utc::now().to_rfc3339(),
         app_version: app.package_info().version.to_string(),
         update_repo_slug,
         settings_path: state.settings_path.display().to_string(),
+        active_app_context,
         runtime_settings,
         privacy_settings,
         perf_snapshot: state.perf_snapshot(),
         history_storage: state.store.history_storage_summary()?,
         devices: dictum_core::audio::device::list_input_devices(),
+        correction_diagnostics,
+    })
+}
+
+#[tauri::command]
+pub async fn export_diagnostics_bundle(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticsExportResult, String> {
+    let bundle = get_diagnostics_bundle(app, state).await?;
+    let settings_path = std::path::PathBuf::from(&bundle.settings_path);
+    let export_dir = settings_path
+        .parent()
+        .map(|parent| parent.join("diagnostics"))
+        .unwrap_or_else(|| std::path::PathBuf::from("diagnostics"));
+    fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let file_name = format!("dictum-diagnostics-{stamp}.json");
+    let path = export_dir.join(&file_name);
+    let payload = serde_json::to_string_pretty(&bundle).map_err(|e| e.to_string())?;
+    fs::write(&path, payload).map_err(|e| e.to_string())?;
+    Ok(DiagnosticsExportResult {
+        path: path.display().to_string(),
+        file_name,
     })
 }
 
@@ -1183,9 +1383,10 @@ pub async fn delete_snippet(state: State<'_, AppState>, id: String) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_repo_slug, parse_sha256_from_sums, select_checksums_asset,
-        select_installer_asset, version_tuple, GitHubAsset,
+        correction_matches_delete_target, normalize_repo_slug, parse_sha256_from_sums,
+        select_checksums_asset, select_installer_asset, version_tuple, GitHubAsset,
     };
+    use crate::settings::LearnedCorrection;
 
     fn asset(name: &str) -> GitHubAsset {
         GitHubAsset {
@@ -1242,5 +1443,74 @@ mod tests {
         let reverse = format!("Dictum_0.1.7_x64-setup.exe {hash}\n");
         let parsed_reverse = parse_sha256_from_sums(&reverse, "Dictum_0.1.7_x64-setup.exe");
         assert_eq!(parsed_reverse.as_deref(), Some(hash));
+    }
+
+    #[test]
+    fn correction_delete_target_matches_exact_scoped_rule() {
+        let rule = LearnedCorrection {
+            heard: "printf".into(),
+            corrected: "println!".into(),
+            hits: 4,
+            mode_affinity: Some("coding".into()),
+            app_profile_affinity: Some("cursor".into()),
+            last_used_at: Some("2026-03-07T10:00:00Z".into()),
+        };
+
+        assert!(correction_matches_delete_target(
+            &rule,
+            "printf",
+            Some("println!"),
+            Some("coding"),
+            Some("cursor"),
+        ));
+        assert!(!correction_matches_delete_target(
+            &rule,
+            "printf",
+            Some("println!"),
+            Some("coding"),
+            None,
+        ));
+        assert!(!correction_matches_delete_target(
+            &rule,
+            "printf",
+            Some("println!"),
+            None,
+            Some("cursor"),
+        ));
+    }
+
+    #[test]
+    fn correction_delete_target_preserves_unscoped_delete_behavior() {
+        let global = LearnedCorrection {
+            heard: "ladder labs".into(),
+            corrected: "Lattice Labs".into(),
+            hits: 1,
+            mode_affinity: None,
+            app_profile_affinity: None,
+            last_used_at: None,
+        };
+        let scoped = LearnedCorrection {
+            heard: "ladder labs".into(),
+            corrected: "Lattice Labs".into(),
+            hits: 3,
+            mode_affinity: Some("conversation".into()),
+            app_profile_affinity: None,
+            last_used_at: Some("2026-03-07T11:00:00Z".into()),
+        };
+
+        assert!(correction_matches_delete_target(
+            &global,
+            "ladder labs",
+            Some("lattice labs"),
+            None,
+            None,
+        ));
+        assert!(correction_matches_delete_target(
+            &scoped,
+            "ladder labs",
+            Some("lattice labs"),
+            None,
+            None,
+        ));
     }
 }

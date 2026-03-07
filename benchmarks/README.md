@@ -40,6 +40,22 @@ cargo run -p dictum-core --features onnx --bin benchmark -- --fixtures benchmark
 - `noisy_room`: speech with realistic ambient noise
 - `long_form`: longer utterances or paragraph-length speech
 
+## Dictation mode coverage
+
+The current smoke pack is still audio-centric, but release decisions for `0.1.8` should be framed against the three product dictation modes:
+
+- `conversation`
+  - validate natural punctuation and prose cleanup
+  - check correction suggestions against plain-language phrases
+- `coding`
+  - validate symbol-heavy phrases, casing, and code-term biasing
+  - compare correction behavior with coding-focused app profiles enabled
+- `command`
+  - validate lowercase command phrases, slash/dash tokens, and punctuation trimming
+  - compare shell-like phrases with and without profile-specific bias terms
+
+When adding future baselines, note which dictation mode and app-profile context were active during the run summary even if the benchmark itself remains fixture-based.
+
 Keep committed fixtures reasonably small. If a larger private pack is used locally, keep the same category structure so reports remain comparable.
 
 ## Baselines
@@ -52,3 +68,13 @@ Commit machine-readable JSON outputs in `baselines/` when changing:
 - fallback/confidence thresholds
 
 Each baseline file should note the hardware and environment used to produce it.
+
+## Supportability notes
+
+For regression triage, pair benchmark results with a diagnostics export from the app:
+
+1. Open Dictum and reproduce the problem case.
+2. In the `Stats` tab, use `Export File` to write a diagnostics bundle locally.
+3. Record the active dictation mode, matched app profile, and relevant benchmark baseline used for comparison.
+
+This keeps perf snapshots, correction diagnostics, and active-context metadata together when investigating tuning changes.
