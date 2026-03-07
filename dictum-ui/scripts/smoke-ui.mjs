@@ -201,8 +201,8 @@ function buildInitScript(config) {
         historyPage: { items: [], total: 0, page: 1, pageSize: 50 },
         diagnosticsBundle: null,
         updateInfo: {
-          currentVersion: "0.1.8-dev.2",
-          latestVersion: "0.1.8-dev.2",
+          currentVersion: "0.1.8-dev.3",
+          latestVersion: "0.1.8-dev.3",
           hasUpdate: false,
           repoSlug: "sinergaoptima/dictum",
           releaseName: null,
@@ -219,7 +219,7 @@ function buildInitScript(config) {
 
       const diagnosticsBundle = {
         generatedAt: new Date().toISOString(),
-        appVersion: "0.1.8-dev.2",
+        appVersion: "0.1.8-dev.3",
         updateRepoSlug: "sinergaoptima/dictum",
         settingsPath: "C:/Users/Test/AppData/Roaming/Dictum/settings.json",
         activeAppContext: state.activeAppContext,
@@ -264,7 +264,7 @@ function buildInitScript(config) {
         invoke: async (cmd, args = {}) => {
           switch (cmd) {
             case "plugin:app|version":
-              return "0.1.8-dev.2";
+              return "0.1.8-dev.3";
             case "plugin:event|listen":
               return Math.floor(Math.random() * 10000);
             case "plugin:event|unlisten":

@@ -1,6 +1,6 @@
 {
   "name": "dictum-ui",
-  "version": "0.1.8-dev.2",
+  "version": "0.1.8-dev.3",
   "private": true,
   "scripts": {
     "dev": "next dev",
