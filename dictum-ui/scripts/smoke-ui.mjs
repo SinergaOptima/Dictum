@@ -105,7 +105,7 @@ async function startManagedServer() {
 function buildInitScript(config) {
   return `
     (() => {
-      const currentVersion = "0.1.8-dev.5";
+      const currentVersion = "0.1.8";
       const state = {
         runtimeSettings: {
           modelProfile: "distil-large-v3",
