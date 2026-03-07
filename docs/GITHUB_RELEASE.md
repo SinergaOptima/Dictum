@@ -73,6 +73,7 @@ Before cutting a public release, verify all of the following locally or in CI:
 - the installer passes Authenticode verification after build
 - the workflow verifies signatures with `signtool verify`, not only `Get-AuthenticodeSignature`
 - if the signing cert is private or self-signed, its public cert is imported into the runner's current-user trust stores before verification
+- the signing step is time-bounded and retries across multiple timestamp servers instead of waiting indefinitely on one TSA
 
 ## 6) Updater smoke test checklist
 
@@ -92,3 +93,4 @@ Run these from the previous public installer, not only from a local dev build:
 - Treat unexpected workflow warnings as release blockers until they are understood or explicitly waived.
 - Keep rollback notes for at least one previous public version in the GitHub release body.
 - Prefer `signtool verify /pa` as the release gate; use `Get-AuthenticodeSignature` mainly for signer metadata inspection.
+- Keep signing and verification steps explicitly time-bounded so runner-side TSA or trust-store issues fail fast.
