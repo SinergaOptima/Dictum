@@ -72,6 +72,7 @@ Before cutting a public release, verify all of the following locally or in CI:
 - `SHA256SUMS.txt` contains entries for both the installer and `dictum.exe`
 - the installer passes Authenticode verification after build
 - the workflow verifies signatures with `signtool verify`, not only `Get-AuthenticodeSignature`
+- if the signing cert is private or self-signed, its public cert is imported into the runner's current-user trust stores before verification
 
 ## 6) Updater smoke test checklist
 

@@ -106,6 +106,10 @@ jobs:
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
           $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath, $env:WINDOWS_CERT_PASSWORD, $flags)
           $subject = $cert.Subject
+          $pubCertPath = Join-Path $env:RUNNER_TEMP "codesign.cer"
+          [IO.File]::WriteAllBytes($pubCertPath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+          Import-Certificate -FilePath $pubCertPath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          Import-Certificate -FilePath $pubCertPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
           if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {
             throw "Signing certificate subject '$subject' does not include expected '$($env:WINDOWS_CERT_EXPECTED_SUBJECT)'."
           }
