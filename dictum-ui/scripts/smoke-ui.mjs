@@ -1,6 +1,106 @@
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { chromium } from "playwright";
 
 const baseUrl = process.env.DICTUM_SMOKE_URL ?? "http://127.0.0.1:3010";
+const managedServer = !process.env.DICTUM_SMOKE_URL;
+const exportDir = path.join(process.cwd(), "out");
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForServer(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { redirect: "manual" });
+      if (response.ok || response.status === 307 || response.status === 308) {
+        return;
+      }
+      lastError = new Error(`Unexpected HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(500);
+  }
+  throw lastError instanceof Error ? lastError : new Error("Server did not become ready.");
+}
+
+function contentTypeFor(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".txt":
+      return "text/plain; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function resolveExportFile(urlPath) {
+  const normalizedPath = decodeURIComponent(urlPath.split("?")[0]);
+  const trimmed = normalizedPath.replace(/^\/+/, "");
+  const candidates = [];
+  if (!trimmed) {
+    candidates.push("index.html");
+  } else {
+    candidates.push(trimmed);
+    candidates.push(`${trimmed}.html`);
+    candidates.push(path.join(trimmed, "index.html"));
+  }
+
+  for (const candidate of candidates) {
+    const filePath = path.join(exportDir, candidate);
+    try {
+      const data = await readFile(filePath);
+      return { filePath, data };
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null;
+}
+
+async function startManagedServer() {
+  const server = createServer(async (req, res) => {
+    const resolved = await resolveExportFile(req.url || "/");
+    if (!resolved) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Not found");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": contentTypeFor(resolved.filePath) });
+    res.end(resolved.data);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(3010, "127.0.0.1", resolve);
+  });
+  await waitForServer(baseUrl, 5000);
+  return server;
+}
 
 function buildInitScript(config) {
   return `
@@ -310,7 +410,7 @@ async function runSettingsAndStatsSmoke(browser) {
   const profileImport = page.getByPlaceholder('[{"name":"Cursor Coding","appMatch":"cursor.exe","dictationMode":"coding","phraseBiasTerms":["TypeScript"],"postUtteranceRefine":true,"enabled":true}]');
   await profileImport.fill('[{"name":"Bad Profile","appMatch":"cursor","dictationMode":"coding"}]');
   await page.getByRole("button", { name: /import profiles/i }).click();
-  await assertText(page, 'Failed to import app profiles: Profile 1: appMatch must be a Windows executable like "cursor.exe".');
+  await assertText(page, 'Failed to import app profiles: Profile 1: appMatch must resolve to a Windows executable like "cursor.exe".');
 
   await page.getByRole("button", { name: /stats/i }).click();
   await assertText(page, "Release Readiness");
@@ -326,6 +426,10 @@ async function runSettingsAndStatsSmoke(browser) {
 }
 
 async function main() {
+  let server = null;
+  if (managedServer) {
+    server = await startManagedServer();
+  }
   const browser = await chromium.launch({ headless: true });
   const failures = [];
   try {
@@ -339,6 +443,9 @@ async function main() {
     failures.push(`Settings/stats smoke: ${error instanceof Error ? error.message : String(error)}`);
   }
   await browser.close();
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
   if (failures.length > 0) {
     console.error(failures.join("\n"));
     process.exit(1);

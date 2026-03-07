@@ -103,7 +103,7 @@ export function PerAppProfilesSection({
         ))}
       </div>
       <p className="settings-note">
-        Presets fill the editor with a starting mode and vocabulary. App matches should be lowercase Windows executables like `cursor.exe` or `slack.exe`.
+        Presets fill the editor with a starting mode and vocabulary. You can paste either a full Windows path or an executable name, and Dictum will normalize it to `cursor.exe` or `slack.exe`.
       </p>
       <div className="settings-fields">
         <label className="settings-field">
@@ -174,7 +174,7 @@ export function PerAppProfilesSection({
               : "Copy JSON"}
         </button>
         <span className="settings-note">
-          Matches use lowercase executable names like `cursor.exe`, `code.exe`, or `windowsterminal.exe`.
+          Matches are stored as executable names like `cursor.exe`, `code.exe`, or `windowsterminal.exe`.
         </span>
       </div>
       <label className="settings-field">

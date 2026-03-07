@@ -293,12 +293,37 @@ pub fn normalize_dictation_mode(raw: &str) -> String {
     }
 }
 
+fn normalize_executable_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let basename = trimmed
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_lowercase();
+    if basename.is_empty() {
+        return None;
+    }
+    if basename.ends_with(".exe") {
+        return Some(basename);
+    }
+    if !basename.contains('.') {
+        return Some(format!("{basename}.exe"));
+    }
+    None
+}
+
 fn normalize_app_profiles(profiles: &[AppProfile]) -> Vec<AppProfile> {
     let mut out = Vec::new();
     for profile in profiles {
         let id = profile.id.trim().to_string();
         let name = profile.name.trim().to_string();
-        let app_match = profile.app_match.trim().to_ascii_lowercase();
+        let Some(app_match) = normalize_executable_name(&profile.app_match) else {
+            continue;
+        };
         if id.is_empty() || name.is_empty() || app_match.is_empty() {
             continue;
         }
@@ -320,14 +345,13 @@ pub fn resolve_app_profile<'a>(
     settings: &'a AppSettings,
     foreground_app: Option<&str>,
 ) -> Option<&'a AppProfile> {
-    let app = foreground_app.unwrap_or_default();
-    if app.is_empty() {
+    let Some(app) = foreground_app.and_then(normalize_executable_name) else {
         return None;
-    }
+    };
     settings
         .app_profiles
         .iter()
-        .find(|profile| profile.enabled && app.contains(profile.app_match.as_str()))
+        .find(|profile| profile.enabled && profile.app_match == app)
 }
 
 pub fn apply_runtime_env_with_profile(
@@ -475,7 +499,10 @@ fn set_runtime_var(name: &str, value: Option<String>, mode: RuntimeEnvMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_learned_corrections, LearnedCorrection};
+    use super::{
+        normalize_app_profiles, normalize_learned_corrections, resolve_app_profile, AppProfile,
+        AppSettings, LearnedCorrection,
+    };
 
     #[test]
     fn normalize_learned_corrections_keeps_distinct_context_variants() {
@@ -529,6 +556,61 @@ mod tests {
             normalized[0].app_profile_affinity.as_deref(),
             Some("slack-profile")
         );
+    }
+
+    #[test]
+    fn normalize_app_profiles_reduces_windows_paths_to_executable_name() {
+        let normalized = normalize_app_profiles(&[AppProfile {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_match: r#""C:\Program Files\Cursor\Cursor.exe""#.into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: vec!["TypeScript".into()],
+            post_utterance_refine: true,
+            enabled: true,
+        }]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].app_match, "cursor.exe");
+    }
+
+    #[test]
+    fn resolve_app_profile_matches_normalized_foreground_basename() {
+        let mut settings = AppSettings::default();
+        settings.app_profiles = vec![AppProfile {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_match: "cursor.exe".into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: Vec::new(),
+            post_utterance_refine: false,
+            enabled: true,
+        }];
+        settings.normalize();
+
+        let matched = resolve_app_profile(
+            &settings,
+            Some(r"C:\Program Files\Cursor\resources\app\Cursor.exe"),
+        )
+        .expect("profile match");
+        assert_eq!(matched.id, "cursor");
+    }
+
+    #[test]
+    fn resolve_app_profile_does_not_match_partial_substrings() {
+        let mut settings = AppSettings::default();
+        settings.app_profiles = vec![AppProfile {
+            id: "code".into(),
+            name: "VS Code".into(),
+            app_match: "code.exe".into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: Vec::new(),
+            post_utterance_refine: false,
+            enabled: true,
+        }];
+        settings.normalize();
+
+        assert!(resolve_app_profile(&settings, Some("mycode-helper.exe")).is_none());
     }
 }
 

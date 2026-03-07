@@ -20,13 +20,16 @@ type UseAppProfilesOptions = {
 };
 
 function normalizeExecutableMatch(value: string, index?: number): string {
-  const appMatch = value.trim().toLowerCase();
+  const trimmed = value.trim().replace(/^["']+|["']+$/g, "");
+  const appMatch = trimmed.split(/[\\/]/).pop()?.trim().toLowerCase() ?? "";
   const label = index == null ? "Profile" : `Profile ${index + 1}`;
   if (!appMatch) {
     throw new Error(`${label}: missing appMatch executable.`);
   }
   if (!appMatch.endsWith(".exe")) {
-    throw new Error(`${label}: appMatch must be a Windows executable like "cursor.exe".`);
+    throw new Error(
+      `${label}: appMatch must resolve to a Windows executable like "cursor.exe".`,
+    );
   }
   return appMatch;
 }
