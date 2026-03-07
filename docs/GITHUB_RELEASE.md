@@ -56,3 +56,34 @@ The workflow generates and uploads:
 - `SHA256SUMS.txt`
 
 On tag builds, these are attached to the GitHub Release automatically.
+
+## 5) Pre-release checklist for Dictum
+
+Before cutting a public release, verify all of the following locally or in CI:
+
+- `cargo check`
+- `cargo test -p dictum-core`
+- `cargo test -p dictum-app`
+- `npm run typecheck`
+- `npm run build`
+- the updater default repo slug is `sinergaoptima/dictum` in both frontend and backend
+- `SHA256SUMS.txt` contains entries for both the installer and `dictum.exe`
+- the installer passes Authenticode verification after build
+
+## 6) Updater smoke test checklist
+
+Run these from the previous public installer, not only from a local dev build:
+
+- check for updates with the default repo slug
+- verify the expected installer asset is discovered
+- verify the expected checksum is discovered
+- verify install launches only when checksum validation succeeds
+- verify invalid repo slug returns a readable error
+- verify missing checksum asset blocks install
+- verify checksum mismatch blocks install
+
+## 7) Release workflow notes
+
+- Use a canary release or manual workflow run after any signing workflow change.
+- Treat unexpected workflow warnings as release blockers until they are understood or explicitly waived.
+- Keep rollback notes for at least one previous public version in the GitHub release body.

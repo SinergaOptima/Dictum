@@ -1,0 +1,1 @@
+Whisper speech benchmark. Soft speech should still be recognized.

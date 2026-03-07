@@ -21,6 +21,7 @@ import type {
   SnippetEntry,
   StatsPayload,
   PerfSnapshot,
+  DiagnosticsBundle,
   ModelProfileMetadata,
   ModelProfileRecommendation,
   AutoTuneResult,
@@ -160,6 +161,9 @@ export const setRuntimeSettings = (
 
 export const getPerfSnapshot = (): Promise<PerfSnapshot> =>
   tauriInvoke("get_perf_snapshot");
+
+export const getDiagnosticsBundle = (): Promise<DiagnosticsBundle> =>
+  tauriInvoke("get_diagnostics_bundle");
 
 export const getPrivacySettings = (): Promise<PrivacySettings> =>
   tauriInvoke("get_privacy_settings");

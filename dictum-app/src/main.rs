@@ -26,14 +26,14 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use dictum_core::{
-    engine::EngineConfig,
     inference::{stub::StubModel, ModelHandle},
     ipc::events::SegmentKind,
     DictumEngine,
 };
 use parking_lot::Mutex;
 use settings::{
-    apply_engine_profile, apply_runtime_env_from_settings, default_settings_path, load_settings,
+    apply_runtime_env_from_settings, default_settings_path, engine_config_for_settings,
+    load_settings, RuntimeEnvMode,
 };
 use state::{AppState, PerfMetrics};
 use storage::{HistoryRecordInput, LocalStore};
@@ -159,7 +159,8 @@ fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let is_visible = window.is_visible().unwrap_or(false);
-        if is_visible {
+        let is_minimized = window.is_minimized().unwrap_or(false);
+        if is_visible && !is_minimized {
             let _ = window.hide();
         } else {
             reveal_main_window(app);
@@ -339,7 +340,7 @@ fn main() {
 
     let settings_path = default_settings_path();
     let app_settings = load_settings(&settings_path);
-    apply_runtime_env_from_settings(&app_settings);
+    apply_runtime_env_from_settings(&app_settings, RuntimeEnvMode::FillMissing);
     info!(
         settings_path = ?settings_path,
         model_profile = %app_settings.model_profile,
@@ -365,8 +366,7 @@ fn main() {
         }
     };
 
-    let mut config = EngineConfig::default();
-    apply_engine_profile(&mut config, &app_settings.performance_profile);
+    let config = engine_config_for_settings(&app_settings);
     info!(
         performance_profile = %app_settings.performance_profile,
         vad_threshold = config.vad_threshold,
@@ -432,6 +432,8 @@ fn main() {
     let inject_success = Arc::new(AtomicUsize::new(0));
     let final_segments_seen = Arc::new(AtomicUsize::new(0));
     let fallback_stub_typed = Arc::new(AtomicUsize::new(0));
+    let duplicate_final_suppressed = Arc::new(AtomicUsize::new(0));
+    let partial_rescues_used = Arc::new(AtomicUsize::new(0));
     let shortcut_toggle_inflight = Arc::new(AtomicBool::new(false));
     let shortcut_toggle_executed = Arc::new(AtomicUsize::new(0));
     let shortcut_toggle_dropped = Arc::new(AtomicUsize::new(0));
@@ -439,6 +441,8 @@ fn main() {
     let inject_success_for_setup = Arc::clone(&inject_success);
     let final_segments_seen_for_setup = Arc::clone(&final_segments_seen);
     let fallback_stub_typed_for_setup = Arc::clone(&fallback_stub_typed);
+    let duplicate_final_suppressed_for_setup = Arc::clone(&duplicate_final_suppressed);
+    let partial_rescues_used_for_setup = Arc::clone(&partial_rescues_used);
     let store_for_setup = Arc::clone(&store);
     let transformer_for_setup = Arc::clone(&transformer);
     let settings_for_setup = Arc::clone(&settings_state);
@@ -467,6 +471,9 @@ fn main() {
             let inject_success_clone = Arc::clone(&inject_success_for_setup);
             let final_segments_seen_clone = Arc::clone(&final_segments_seen_for_setup);
             let fallback_stub_typed_clone = Arc::clone(&fallback_stub_typed_for_setup);
+            let duplicate_final_suppressed_clone =
+                Arc::clone(&duplicate_final_suppressed_for_setup);
+            let partial_rescues_used_clone = Arc::clone(&partial_rescues_used_for_setup);
             let store_clone = Arc::clone(&store_for_setup);
             let transformer_clone = Arc::clone(&transformer_for_setup);
             let settings_clone = Arc::clone(&settings_for_setup);
@@ -541,6 +548,8 @@ fn main() {
                                         {
                                             final_text = partial.trim().to_string();
                                             used_partial_rescue = true;
+                                            partial_rescues_used_clone
+                                                .fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(
                                                 "using recent partial transcript as fallback rescue for placeholder final segment"
                                             );
@@ -568,6 +577,8 @@ fn main() {
                                         now,
                                         Duration::from_millis(700),
                                     ) {
+                                        duplicate_final_suppressed_clone
+                                            .fetch_add(1, Ordering::Relaxed);
                                         let finalize_elapsed_ms =
                                             finalize_started.elapsed().as_secs_f64() * 1000.0;
                                         perf_metrics_clone
@@ -701,6 +712,8 @@ fn main() {
             inject_success,
             final_segments_seen,
             fallback_stub_typed,
+            duplicate_final_suppressed,
+            partial_rescues_used,
             shortcut_toggle_inflight,
             shortcut_toggle_executed,
             shortcut_toggle_dropped,
@@ -730,6 +743,7 @@ fn main() {
             commands::learn_correction,
             commands::delete_learned_correction,
             commands::get_perf_snapshot,
+            commands::get_diagnostics_bundle,
             commands::get_privacy_settings,
             commands::set_privacy_settings,
             commands::get_history,

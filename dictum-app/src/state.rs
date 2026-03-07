@@ -32,6 +32,10 @@ pub struct AppState {
     pub final_segments_seen: Arc<AtomicUsize>,
     /// Count of emitted fallback placeholders that were typed.
     pub fallback_stub_typed: Arc<AtomicUsize>,
+    /// Count of final transcript emissions skipped by duplicate suppression.
+    pub duplicate_final_suppressed: Arc<AtomicUsize>,
+    /// Count of placeholder finals rescued using the latest partial transcript.
+    pub partial_rescues_used: Arc<AtomicUsize>,
     /// Guard to prevent overlapping shortcut-triggered toggle operations.
     pub shortcut_toggle_inflight: Arc<AtomicBool>,
     /// Count of shortcut toggles accepted for execution.
@@ -60,6 +64,8 @@ impl AppState {
             inject_success: self.inject_success.load(Ordering::Relaxed),
             final_segments_seen: self.final_segments_seen.load(Ordering::Relaxed),
             fallback_stub_typed: self.fallback_stub_typed.load(Ordering::Relaxed),
+            duplicate_final_suppressed: self.duplicate_final_suppressed.load(Ordering::Relaxed),
+            partial_rescues_used: self.partial_rescues_used.load(Ordering::Relaxed),
             shortcut_toggle_executed: self.shortcut_toggle_executed.load(Ordering::Relaxed),
             shortcut_toggle_dropped: self.shortcut_toggle_dropped.load(Ordering::Relaxed),
             pipeline_frames_in: pipeline.frames_in,
@@ -70,6 +76,10 @@ impl AppState {
             pipeline_inference_errors: pipeline.inference_errors,
             pipeline_segments_emitted: pipeline.segments_emitted,
             pipeline_fallback_emitted: pipeline.fallback_emitted,
+            pipeline_drain_ms: perf_stage_snapshot_from_pipeline(pipeline.drain_ms),
+            pipeline_resample_ms: perf_stage_snapshot_from_pipeline(pipeline.resample_ms),
+            pipeline_vad_ms: perf_stage_snapshot_from_pipeline(pipeline.vad_ms),
+            pipeline_inference_ms: perf_stage_snapshot_from_pipeline(pipeline.inference_ms),
         }
     }
 
@@ -78,6 +88,10 @@ impl AppState {
         let metrics = self.perf_metrics.lock().snapshot();
         PerfSnapshot {
             diagnostics: diag,
+            drain_ms: diag.pipeline_drain_ms,
+            resample_ms: diag.pipeline_resample_ms,
+            vad_ms: diag.pipeline_vad_ms,
+            inference_ms: diag.pipeline_inference_ms,
             transform_ms: metrics.transform_ms,
             inject_ms: metrics.inject_ms,
             persist_ms: metrics.persist_ms,
@@ -92,6 +106,8 @@ pub struct AppDiagnostics {
     pub inject_success: usize,
     pub final_segments_seen: usize,
     pub fallback_stub_typed: usize,
+    pub duplicate_final_suppressed: usize,
+    pub partial_rescues_used: usize,
     pub shortcut_toggle_executed: usize,
     pub shortcut_toggle_dropped: usize,
     pub pipeline_frames_in: usize,
@@ -102,12 +118,20 @@ pub struct AppDiagnostics {
     pub pipeline_inference_errors: usize,
     pub pipeline_segments_emitted: usize,
     pub pipeline_fallback_emitted: usize,
+    pub pipeline_drain_ms: PerfStageSnapshot,
+    pub pipeline_resample_ms: PerfStageSnapshot,
+    pub pipeline_vad_ms: PerfStageSnapshot,
+    pub pipeline_inference_ms: PerfStageSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PerfSnapshot {
     pub diagnostics: AppDiagnostics,
+    pub drain_ms: PerfStageSnapshot,
+    pub resample_ms: PerfStageSnapshot,
+    pub vad_ms: PerfStageSnapshot,
+    pub inference_ms: PerfStageSnapshot,
     pub transform_ms: PerfStageSnapshot,
     pub inject_ms: PerfStageSnapshot,
     pub persist_ms: PerfStageSnapshot,
@@ -257,6 +281,8 @@ impl Serialize for AppDiagnostics {
             inject_success: usize,
             final_segments_seen: usize,
             fallback_stub_typed: usize,
+            duplicate_final_suppressed: usize,
+            partial_rescues_used: usize,
             shortcut_toggle_executed: usize,
             shortcut_toggle_dropped: usize,
             pipeline_frames_in: usize,
@@ -267,6 +293,10 @@ impl Serialize for AppDiagnostics {
             pipeline_inference_errors: usize,
             pipeline_segments_emitted: usize,
             pipeline_fallback_emitted: usize,
+            pipeline_drain_ms: PerfStageSnapshot,
+            pipeline_resample_ms: PerfStageSnapshot,
+            pipeline_vad_ms: PerfStageSnapshot,
+            pipeline_inference_ms: PerfStageSnapshot,
         }
 
         let repr = Repr {
@@ -274,6 +304,8 @@ impl Serialize for AppDiagnostics {
             inject_success: self.inject_success,
             final_segments_seen: self.final_segments_seen,
             fallback_stub_typed: self.fallback_stub_typed,
+            duplicate_final_suppressed: self.duplicate_final_suppressed,
+            partial_rescues_used: self.partial_rescues_used,
             shortcut_toggle_executed: self.shortcut_toggle_executed,
             shortcut_toggle_dropped: self.shortcut_toggle_dropped,
             pipeline_frames_in: self.pipeline_frames_in,
@@ -284,7 +316,24 @@ impl Serialize for AppDiagnostics {
             pipeline_inference_errors: self.pipeline_inference_errors,
             pipeline_segments_emitted: self.pipeline_segments_emitted,
             pipeline_fallback_emitted: self.pipeline_fallback_emitted,
+            pipeline_drain_ms: self.pipeline_drain_ms,
+            pipeline_resample_ms: self.pipeline_resample_ms,
+            pipeline_vad_ms: self.pipeline_vad_ms,
+            pipeline_inference_ms: self.pipeline_inference_ms,
         };
         repr.serialize(serializer)
+    }
+}
+
+fn perf_stage_snapshot_from_pipeline(
+    snapshot: dictum_core::engine::pipeline::StageTimingSnapshot,
+) -> PerfStageSnapshot {
+    PerfStageSnapshot {
+        count: snapshot.count,
+        mean_ms: snapshot.mean_ms,
+        p50_ms: snapshot.p50_ms,
+        p95_ms: snapshot.p95_ms,
+        p99_ms: snapshot.p99_ms,
+        max_ms: snapshot.max_ms,
     }
 }

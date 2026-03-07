@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dictum_core::engine::EngineConfig;
+use dictum_core::{engine::EngineConfig, DictumEngine};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +101,12 @@ pub struct RuntimeSettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub correction_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeEnvMode {
+    FillMissing,
+    Overwrite,
 }
 
 impl AppSettings {
@@ -216,6 +222,12 @@ pub fn apply_engine_profile(config: &mut EngineConfig, profile: &str) {
     }
 }
 
+pub fn engine_config_for_settings(settings: &AppSettings) -> EngineConfig {
+    let mut config = EngineConfig::default();
+    apply_engine_profile(&mut config, &settings.performance_profile);
+    config
+}
+
 pub fn normalize_model_profile(raw: &str) -> String {
     let profile = raw.trim().to_ascii_lowercase();
     match profile.as_str() {
@@ -325,88 +337,104 @@ fn normalize_learned_corrections(raw: &[LearnedCorrection]) -> Vec<LearnedCorrec
     out
 }
 
-pub fn apply_runtime_env_from_settings(settings: &AppSettings) {
-    if std::env::var("DICTUM_MODEL_PROFILE").is_err() {
-        std::env::set_var("DICTUM_MODEL_PROFILE", &settings.model_profile);
+fn set_runtime_var(name: &str, value: Option<String>, mode: RuntimeEnvMode) {
+    if mode == RuntimeEnvMode::FillMissing && std::env::var(name).is_ok() {
+        return;
     }
 
-    if std::env::var("DICTUM_ORT_EP").is_err() {
-        std::env::set_var("DICTUM_ORT_EP", &settings.ort_ep);
+    match value {
+        Some(value) => std::env::set_var(name, value),
+        None if mode == RuntimeEnvMode::Overwrite => std::env::remove_var(name),
+        None => {}
     }
-    if std::env::var("DICTUM_ORT_INTRA_THREADS").is_err() {
-        if settings.ort_intra_threads > 0 {
-            std::env::set_var(
-                "DICTUM_ORT_INTRA_THREADS",
-                settings.ort_intra_threads.to_string(),
-            );
-        }
-    }
-    if std::env::var("DICTUM_ORT_INTER_THREADS").is_err() {
-        if settings.ort_inter_threads > 0 {
-            std::env::set_var(
-                "DICTUM_ORT_INTER_THREADS",
-                settings.ort_inter_threads.to_string(),
-            );
-        }
-    }
-    if std::env::var("DICTUM_ORT_PARALLEL").is_err() {
-        std::env::set_var(
-            "DICTUM_ORT_PARALLEL",
-            if settings.ort_parallel { "1" } else { "0" },
-        );
-    }
-    if std::env::var("DICTUM_PERFORMANCE_PROFILE").is_err() {
-        std::env::set_var("DICTUM_PERFORMANCE_PROFILE", &settings.performance_profile);
-    }
-    if std::env::var("DICTUM_LANGUAGE_HINT").is_err() {
-        std::env::set_var("DICTUM_LANGUAGE_HINT", &settings.language_hint);
-    }
-    if std::env::var("DICTUM_CLOUD_FALLBACK").is_err() {
-        std::env::set_var(
-            "DICTUM_CLOUD_FALLBACK",
+}
+
+pub fn apply_runtime_env_from_settings(settings: &AppSettings, mode: RuntimeEnvMode) {
+    set_runtime_var(
+        "DICTUM_MODEL_PROFILE",
+        Some(settings.model_profile.clone()),
+        mode,
+    );
+    set_runtime_var("DICTUM_ORT_EP", Some(settings.ort_ep.clone()), mode);
+    set_runtime_var(
+        "DICTUM_ORT_INTRA_THREADS",
+        (settings.ort_intra_threads > 0).then(|| settings.ort_intra_threads.to_string()),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_ORT_INTER_THREADS",
+        (settings.ort_inter_threads > 0).then(|| settings.ort_inter_threads.to_string()),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_ORT_PARALLEL",
+        Some(if settings.ort_parallel { "1" } else { "0" }.to_string()),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_PERFORMANCE_PROFILE",
+        Some(settings.performance_profile.clone()),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_LANGUAGE_HINT",
+        Some(settings.language_hint.clone()),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_CLOUD_FALLBACK",
+        Some(
             if settings.cloud_mode == "local_only" {
                 "0"
             } else {
                 "1"
-            },
-        );
-    }
-    if std::env::var("DICTUM_CLOUD_MODE").is_err() {
-        std::env::set_var("DICTUM_CLOUD_MODE", &settings.cloud_mode);
-    }
-    if std::env::var("DICTUM_OPENAI_API_KEY").is_err() {
-        if let Some(key) = settings.openai_api_key.as_ref() {
-            std::env::set_var("DICTUM_OPENAI_API_KEY", key);
-        }
-    }
-    if std::env::var("DICTUM_INPUT_GAIN_BOOST").is_err() {
-        std::env::set_var(
-            "DICTUM_INPUT_GAIN_BOOST",
-            format!("{:.4}", settings.input_gain_boost),
-        );
-    }
-    if std::env::var("DICTUM_POST_UTTERANCE_REFINEMENT").is_err() {
-        std::env::set_var(
-            "DICTUM_POST_UTTERANCE_REFINEMENT",
+            }
+            .to_string(),
+        ),
+        mode,
+    );
+    set_runtime_var("DICTUM_CLOUD_MODE", Some(settings.cloud_mode.clone()), mode);
+    set_runtime_var(
+        "DICTUM_OPENAI_API_KEY",
+        settings.openai_api_key.clone(),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_INPUT_GAIN_BOOST",
+        Some(format!("{:.4}", settings.input_gain_boost)),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_POST_UTTERANCE_REFINEMENT",
+        Some(
             if settings.post_utterance_refine {
                 "1"
             } else {
                 "0"
-            },
-        );
-    }
-    if std::env::var("DICTUM_PHRASE_BIAS_TERMS").is_err() {
-        std::env::set_var(
-            "DICTUM_PHRASE_BIAS_TERMS",
-            settings.phrase_bias_terms.join("\n"),
-        );
-    }
-    if std::env::var("DICTUM_RELIABILITY_MODE").is_err() {
-        std::env::set_var(
-            "DICTUM_RELIABILITY_MODE",
-            if settings.reliability_mode { "1" } else { "0" },
-        );
-    }
+            }
+            .to_string(),
+        ),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_PHRASE_BIAS_TERMS",
+        Some(settings.phrase_bias_terms.join("\n")),
+        mode,
+    );
+    set_runtime_var(
+        "DICTUM_RELIABILITY_MODE",
+        Some(if settings.reliability_mode { "1" } else { "0" }.to_string()),
+        mode,
+    );
+}
+
+pub fn sync_runtime_with_settings(
+    engine: &DictumEngine,
+    settings: &AppSettings,
+    env_mode: RuntimeEnvMode,
+) {
+    engine.update_config(engine_config_for_settings(settings));
+    apply_runtime_env_from_settings(settings, env_mode);
 }
 
 pub fn default_settings_path() -> PathBuf {

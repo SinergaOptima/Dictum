@@ -3,7 +3,7 @@
 //! Each function is registered with `tauri::Builder::invoke_handler` and
 //! callable from the frontend via `invoke(...)`.
 
-use dictum_core::{audio::device::DeviceInfo, engine::EngineConfig, ipc::events::EngineStatus};
+use dictum_core::{audio::device::DeviceInfo, ipc::events::EngineStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::State;
@@ -15,22 +15,19 @@ use crate::model_profiles::{
     ModelProfileRecommendation,
 };
 use crate::settings::{
-    apply_engine_profile, normalize_cloud_mode, normalize_language_hint, normalize_model_profile,
-    normalize_ort_ep, normalize_performance_profile, normalize_toggle_shortcut, save_settings,
-    LearnedCorrection, RuntimeSettings,
+    normalize_cloud_mode, normalize_language_hint, normalize_model_profile, normalize_ort_ep,
+    normalize_performance_profile, normalize_toggle_shortcut, save_settings,
+    sync_runtime_with_settings, LearnedCorrection, RuntimeEnvMode, RuntimeSettings,
 };
 use crate::state::{AppState, PerfSnapshot};
-use crate::storage::{DictionaryEntry, HistoryPage, PrivacySettings, SnippetEntry, StatsPayload};
+use crate::storage::{
+    DictionaryEntry, HistoryPage, HistoryStorageSummary, PrivacySettings, SnippetEntry,
+    StatsPayload,
+};
 
 const DEFAULT_UPDATE_REPO_SLUG: &str = "sinergaoptima/dictum";
 const LEGACY_UPDATE_REPO_SLUGS: &[&str] = &["latticelabs/dictum"];
 const UPDATE_TIMEOUT_SECS: u64 = 45;
-
-fn runtime_engine_config(performance_profile: &str) -> EngineConfig {
-    let mut config = EngineConfig::default();
-    apply_engine_profile(&mut config, performance_profile);
-    config
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +65,20 @@ pub struct AppUpdateInfo {
     pub checksum_asset_name: Option<String>,
     pub checksum_asset_download_url: Option<String>,
     pub expected_installer_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsBundle {
+    pub generated_at: String,
+    pub app_version: String,
+    pub update_repo_slug: String,
+    pub settings_path: String,
+    pub runtime_settings: RuntimeSettings,
+    pub privacy_settings: PrivacySettings,
+    pub perf_snapshot: PerfSnapshot,
+    pub history_storage: HistoryStorageSummary,
+    pub devices: Vec<DeviceInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -617,28 +628,7 @@ pub async fn run_auto_tune(state: State<'_, AppState>) -> Result<AutoTuneResult,
     settings.ort_parallel = ort_parallel;
     settings.performance_profile = normalize_performance_profile(performance_profile);
     settings.normalize();
-    state
-        .engine
-        .update_config(runtime_engine_config(&settings.performance_profile));
-
-    std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
-    std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
-    std::env::set_var(
-        "DICTUM_PERFORMANCE_PROFILE",
-        settings.performance_profile.clone(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_INTRA_THREADS",
-        settings.ort_intra_threads.to_string(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_INTER_THREADS",
-        settings.ort_inter_threads.to_string(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_PARALLEL",
-        if settings.ort_parallel { "1" } else { "0" },
-    );
+    sync_runtime_with_settings(state.engine.as_ref(), &settings, RuntimeEnvMode::Overwrite);
 
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
     let runtime = settings.runtime_settings();
@@ -725,32 +715,7 @@ pub async fn run_benchmark_auto_tune(
     settings.input_gain_boost = input_gain_boost;
     settings.activity_clip_threshold = clip_threshold;
     settings.normalize();
-    state
-        .engine
-        .update_config(runtime_engine_config(&settings.performance_profile));
-
-    std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
-    std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
-    std::env::set_var(
-        "DICTUM_PERFORMANCE_PROFILE",
-        settings.performance_profile.clone(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_INTRA_THREADS",
-        settings.ort_intra_threads.to_string(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_INTER_THREADS",
-        settings.ort_inter_threads.to_string(),
-    );
-    std::env::set_var(
-        "DICTUM_ORT_PARALLEL",
-        if settings.ort_parallel { "1" } else { "0" },
-    );
-    std::env::set_var(
-        "DICTUM_INPUT_GAIN_BOOST",
-        format!("{:.4}", settings.input_gain_boost),
-    );
+    sync_runtime_with_settings(state.engine.as_ref(), &settings, RuntimeEnvMode::Overwrite);
 
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
     let runtime = settings.runtime_settings();
@@ -965,9 +930,6 @@ pub async fn set_runtime_settings(
         settings.retention_days = v.clamp(1, 3650);
     }
     settings.normalize();
-    state
-        .engine
-        .update_config(runtime_engine_config(&settings.performance_profile));
 
     let global_shortcut = app.global_shortcut();
     if settings.toggle_shortcut != previous_shortcut {
@@ -986,68 +948,7 @@ pub async fn set_runtime_settings(
         }
     }
 
-    std::env::set_var("DICTUM_MODEL_PROFILE", settings.model_profile.clone());
-    std::env::set_var("DICTUM_ORT_EP", settings.ort_ep.clone());
-    if settings.ort_intra_threads > 0 {
-        std::env::set_var(
-            "DICTUM_ORT_INTRA_THREADS",
-            settings.ort_intra_threads.to_string(),
-        );
-    } else {
-        std::env::remove_var("DICTUM_ORT_INTRA_THREADS");
-    }
-    if settings.ort_inter_threads > 0 {
-        std::env::set_var(
-            "DICTUM_ORT_INTER_THREADS",
-            settings.ort_inter_threads.to_string(),
-        );
-    } else {
-        std::env::remove_var("DICTUM_ORT_INTER_THREADS");
-    }
-    std::env::set_var(
-        "DICTUM_ORT_PARALLEL",
-        if settings.ort_parallel { "1" } else { "0" },
-    );
-    std::env::set_var("DICTUM_LANGUAGE_HINT", settings.language_hint.clone());
-    std::env::set_var(
-        "DICTUM_PERFORMANCE_PROFILE",
-        settings.performance_profile.clone(),
-    );
-    std::env::set_var(
-        "DICTUM_CLOUD_FALLBACK",
-        if settings.cloud_mode == "local_only" {
-            "0"
-        } else {
-            "1"
-        },
-    );
-    std::env::set_var("DICTUM_CLOUD_MODE", settings.cloud_mode.clone());
-    std::env::set_var(
-        "DICTUM_INPUT_GAIN_BOOST",
-        format!("{:.4}", settings.input_gain_boost),
-    );
-    std::env::set_var(
-        "DICTUM_POST_UTTERANCE_REFINEMENT",
-        if settings.post_utterance_refine {
-            "1"
-        } else {
-            "0"
-        },
-    );
-    std::env::set_var(
-        "DICTUM_PHRASE_BIAS_TERMS",
-        settings.phrase_bias_terms.join("\n"),
-    );
-    std::env::set_var(
-        "DICTUM_RELIABILITY_MODE",
-        if settings.reliability_mode { "1" } else { "0" },
-    );
-    if let Some(api_key) = settings.openai_api_key.as_ref() {
-        std::env::set_var("DICTUM_OPENAI_API_KEY", api_key);
-    } else {
-        std::env::remove_var("DICTUM_OPENAI_API_KEY");
-    }
-
+    sync_runtime_with_settings(state.engine.as_ref(), &settings, RuntimeEnvMode::Overwrite);
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
     state.store.prune_history(settings.retention_days)?;
     Ok(settings.runtime_settings())
@@ -1056,6 +957,33 @@ pub async fn set_runtime_settings(
 #[tauri::command]
 pub async fn get_perf_snapshot(state: State<'_, AppState>) -> Result<PerfSnapshot, String> {
     Ok(state.perf_snapshot())
+}
+
+#[tauri::command]
+pub async fn get_diagnostics_bundle(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticsBundle, String> {
+    let runtime_settings = state.settings.lock().runtime_settings();
+    let privacy_settings = PrivacySettings {
+        history_enabled: runtime_settings.history_enabled,
+        retention_days: runtime_settings.retention_days,
+        cloud_opt_in: runtime_settings.cloud_opt_in,
+    };
+    let update_repo_slug =
+        normalize_repo_slug(None).unwrap_or_else(|_| DEFAULT_UPDATE_REPO_SLUG.to_string());
+
+    Ok(DiagnosticsBundle {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        app_version: app.package_info().version.to_string(),
+        update_repo_slug,
+        settings_path: state.settings_path.display().to_string(),
+        runtime_settings,
+        privacy_settings,
+        perf_snapshot: state.perf_snapshot(),
+        history_storage: state.store.history_storage_summary()?,
+        devices: dictum_core::audio::device::list_input_devices(),
+    })
 }
 
 #[tauri::command]
@@ -1097,15 +1025,7 @@ pub async fn set_privacy_settings(
     settings.normalize();
     save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
     state.store.prune_history(settings.retention_days)?;
-    std::env::set_var(
-        "DICTUM_CLOUD_FALLBACK",
-        if settings.cloud_mode == "local_only" {
-            "0"
-        } else {
-            "1"
-        },
-    );
-    std::env::set_var("DICTUM_CLOUD_MODE", settings.cloud_mode.clone());
+    sync_runtime_with_settings(state.engine.as_ref(), &settings, RuntimeEnvMode::Overwrite);
     Ok(PrivacySettings {
         history_enabled: settings.history_enabled,
         retention_days: settings.retention_days,
@@ -1184,4 +1104,69 @@ pub async fn delete_snippet(state: State<'_, AppState>, id: String) -> Result<()
     state.store.delete_snippet(&id)?;
     state.transformer.refresh()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_repo_slug, parse_sha256_from_sums, select_checksums_asset,
+        select_installer_asset, version_tuple, GitHubAsset,
+    };
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+        }
+    }
+
+    #[test]
+    fn normalize_repo_slug_maps_legacy_slug() {
+        let slug = normalize_repo_slug(Some("LatticeLabs/Dictum".into())).expect("slug");
+        assert_eq!(slug, "sinergaoptima/dictum");
+    }
+
+    #[test]
+    fn normalize_repo_slug_rejects_invalid_shape() {
+        assert!(normalize_repo_slug(Some("invalid".into())).is_err());
+        assert!(normalize_repo_slug(Some("owner/repo/extra".into())).is_err());
+        assert!(normalize_repo_slug(Some("bad!/repo".into())).is_err());
+    }
+
+    #[test]
+    fn version_tuple_parses_semver_and_strips_prefixes() {
+        assert_eq!(version_tuple("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(version_tuple("1.2.3-beta.1"), Some((1, 2, 3)));
+        assert_eq!(version_tuple("V2.0"), Some((2, 0, 0)));
+    }
+
+    #[test]
+    fn select_installer_asset_prefers_setup_exe() {
+        let assets = vec![
+            asset("Dictum_0.1.7_x64.msi"),
+            asset("Dictum_0.1.7_x64-setup.exe"),
+            asset("dictum.exe"),
+        ];
+        let picked = select_installer_asset(&assets).expect("installer");
+        assert_eq!(picked.name, "Dictum_0.1.7_x64-setup.exe");
+    }
+
+    #[test]
+    fn select_checksums_asset_finds_manifest_case_insensitively() {
+        let assets = vec![asset("notes.txt"), asset("SHA256SUMS.txt")];
+        let picked = select_checksums_asset(&assets).expect("checksums");
+        assert_eq!(picked.name, "SHA256SUMS.txt");
+    }
+
+    #[test]
+    fn parse_sha256_from_sums_supports_common_formats() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let contents = format!("{hash}  Dictum_0.1.7_x64-setup.exe\n");
+        let parsed = parse_sha256_from_sums(&contents, "Dictum_0.1.7_x64-setup.exe");
+        assert_eq!(parsed.as_deref(), Some(hash));
+
+        let reverse = format!("Dictum_0.1.7_x64-setup.exe {hash}\n");
+        let parsed_reverse = parse_sha256_from_sums(&reverse, "Dictum_0.1.7_x64-setup.exe");
+        assert_eq!(parsed_reverse.as_deref(), Some(hash));
+    }
 }

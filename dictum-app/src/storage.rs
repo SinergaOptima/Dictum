@@ -5,11 +5,13 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use rand::RngCore;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+const HISTORY_PAGE_SCAN_BATCH: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +88,15 @@ pub struct PrivacySettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub cloud_opt_in: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStorageSummary {
+    pub db_path: String,
+    pub total_records: usize,
+    pub oldest_created_at: Option<String>,
+    pub newest_created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,60 +309,89 @@ impl LocalStore {
     ) -> Result<HistoryPage, String> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 200);
+        let start = (page - 1).saturating_mul(page_size);
         let conn = self.open()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, created_at, text_enc, source, latency_ms, word_count, char_count, dictionary_applied, snippet_applied
-                 FROM dictation_history ORDER BY created_at DESC LIMIT 5000",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         let query = query
             .as_ref()
             .map(|q| q.trim().to_ascii_lowercase())
             .filter(|q| !q.is_empty());
 
-        let mut items = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let enc: String = row.get(2).map_err(|e| e.to_string())?;
-            let Some(text) = self.cipher.decrypt(&enc) else {
-                continue;
-            };
-            if let Some(ref q) = query {
-                if !text.to_ascii_lowercase().contains(q) {
-                    continue;
+        if query.is_none() {
+            let total = conn
+                .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|e| e.to_string())? as usize;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, created_at, text_enc, source, latency_ms, word_count, char_count, dictionary_applied, snippet_applied
+                     FROM dictation_history
+                     ORDER BY created_at DESC
+                     LIMIT ?1 OFFSET ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut rows = stmt
+                .query(params![page_size as i64, start as i64])
+                .map_err(|e| e.to_string())?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                if let Some(item) = self.read_history_row(row)? {
+                    items.push(item);
                 }
             }
-            let created_at: i64 = row.get(1).map_err(|e| e.to_string())?;
-            let created = Utc
-                .timestamp_opt(created_at, 0)
-                .single()
-                .unwrap_or_else(Utc::now)
-                .to_rfc3339();
-            items.push(HistoryItem {
-                id: row.get(0).map_err(|e| e.to_string())?,
-                created_at: created,
-                text,
-                source: row.get(3).map_err(|e| e.to_string())?,
-                latency_ms: row.get(4).map_err(|e| e.to_string())?,
-                word_count: row.get::<_, i64>(5).map_err(|e| e.to_string())? as usize,
-                char_count: row.get::<_, i64>(6).map_err(|e| e.to_string())? as usize,
-                dictionary_applied: row.get::<_, i64>(7).map_err(|e| e.to_string())? != 0,
-                snippet_applied: row.get::<_, i64>(8).map_err(|e| e.to_string())? != 0,
+
+            return Ok(HistoryPage {
+                items,
+                total,
+                page,
+                page_size,
             });
         }
 
-        let total = items.len();
-        let start = (page - 1).saturating_mul(page_size);
-        let end = (start + page_size).min(total);
-        let paged = if start >= total {
-            Vec::new()
-        } else {
-            items[start..end].to_vec()
-        };
+        let query = query.expect("query checked above");
+        let mut offset = 0usize;
+        let mut total = 0usize;
+        let mut items = Vec::new();
+        let end = start.saturating_add(page_size);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, created_at, text_enc, source, latency_ms, word_count, char_count, dictionary_applied, snippet_applied
+                 FROM dictation_history
+                 ORDER BY created_at DESC
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(|e| e.to_string())?;
+
+        loop {
+            let mut rows = stmt
+                .query(params![HISTORY_PAGE_SCAN_BATCH as i64, offset as i64])
+                .map_err(|e| e.to_string())?;
+            let mut scanned = 0usize;
+
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                scanned += 1;
+                let Some(item) = self.read_history_row(row)? else {
+                    continue;
+                };
+                if !item.text.to_ascii_lowercase().contains(&query) {
+                    continue;
+                }
+
+                if total >= start && total < end {
+                    items.push(item);
+                }
+                total += 1;
+            }
+
+            if scanned < HISTORY_PAGE_SCAN_BATCH {
+                break;
+            }
+            offset = offset.saturating_add(HISTORY_PAGE_SCAN_BATCH);
+        }
 
         Ok(HistoryPage {
-            items: paged,
+            items,
             total,
             page,
             page_size,
@@ -391,78 +431,87 @@ impl LocalStore {
         let range_days = range_days.clamp(1, 365);
         let cutoff = Utc::now() - Duration::days(range_days as i64);
         let conn = self.open()?;
+        let totals = conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(word_count), 0),
+                    COALESCE(SUM(char_count), 0),
+                    COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0.0)
+                 FROM dictation_history
+                 WHERE created_at >= ?1",
+                params![cutoff.timestamp()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as usize,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, i64>(2)? as usize,
+                        row.get::<_, f64>(3)? as f32,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
         let mut stmt = conn
             .prepare(
-                "SELECT created_at, word_count, char_count, latency_ms
+                "SELECT
+                    date(created_at, 'unixepoch') AS day,
+                    COUNT(*) AS utterances,
+                    COALESCE(SUM(word_count), 0) AS words,
+                    COALESCE(SUM(char_count), 0) AS chars,
+                    COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0.0) AS avg_latency_ms
                  FROM dictation_history
                  WHERE created_at >= ?1
-                 ORDER BY created_at ASC",
+                 GROUP BY day
+                 ORDER BY day ASC",
             )
             .map_err(|e| e.to_string())?;
         let mut rows = stmt
             .query(params![cutoff.timestamp()])
             .map_err(|e| e.to_string())?;
 
-        #[derive(Default)]
-        struct DayAgg {
-            utterances: usize,
-            words: usize,
-            chars: usize,
-            latency_total: i64,
-        }
-
-        let mut buckets: std::collections::BTreeMap<(i32, u32, u32), DayAgg> =
-            std::collections::BTreeMap::new();
-        let mut total_utterances = 0usize;
-        let mut total_words = 0usize;
-        let mut total_chars = 0usize;
-        let mut latency_total = 0i64;
-
+        let mut out_buckets = Vec::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let ts: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let words: usize = row.get::<_, i64>(1).map_err(|e| e.to_string())? as usize;
-            let chars: usize = row.get::<_, i64>(2).map_err(|e| e.to_string())? as usize;
-            let latency: i64 = row.get(3).map_err(|e| e.to_string())?;
-            let dt = Utc.timestamp_opt(ts, 0).single().unwrap_or_else(Utc::now);
-            let key = (dt.year(), dt.month(), dt.day());
-            let day = buckets.entry(key).or_default();
-            day.utterances += 1;
-            day.words += words;
-            day.chars += chars;
-            day.latency_total += latency.max(0);
-
-            total_utterances += 1;
-            total_words += words;
-            total_chars += chars;
-            latency_total += latency.max(0);
-        }
-
-        let mut out_buckets = Vec::with_capacity(buckets.len());
-        for ((y, m, d), day) in buckets {
             out_buckets.push(StatsBucket {
-                date: format!("{y:04}-{m:02}-{d:02}"),
-                utterances: day.utterances,
-                words: day.words,
-                chars: day.chars,
-                avg_latency_ms: if day.utterances == 0 {
-                    0.0
-                } else {
-                    day.latency_total as f32 / day.utterances as f32
-                },
+                date: row.get(0).map_err(|e| e.to_string())?,
+                utterances: row.get::<_, i64>(1).map_err(|e| e.to_string())? as usize,
+                words: row.get::<_, i64>(2).map_err(|e| e.to_string())? as usize,
+                chars: row.get::<_, i64>(3).map_err(|e| e.to_string())? as usize,
+                avg_latency_ms: row.get::<_, f64>(4).map_err(|e| e.to_string())? as f32,
             });
         }
 
         Ok(StatsPayload {
             range_days,
-            total_utterances,
-            total_words,
-            total_chars,
-            avg_latency_ms: if total_utterances == 0 {
-                0.0
-            } else {
-                latency_total as f32 / total_utterances as f32
-            },
+            total_utterances: totals.0,
+            total_words: totals.1,
+            total_chars: totals.2,
+            avg_latency_ms: totals.3,
             buckets: out_buckets,
+        })
+    }
+
+    pub fn history_storage_summary(&self) -> Result<HistoryStorageSummary, String> {
+        let conn = self.open()?;
+        let (total_records, oldest, newest) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM dictation_history",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as usize,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(HistoryStorageSummary {
+            db_path: self.db_path.display().to_string(),
+            total_records,
+            oldest_created_at: oldest.map(ts_to_rfc3339),
+            newest_created_at: newest.map(ts_to_rfc3339),
         })
     }
 
@@ -604,6 +653,29 @@ impl LocalStore {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    fn read_history_row(&self, row: &rusqlite::Row<'_>) -> Result<Option<HistoryItem>, String> {
+        let enc: String = row.get(2).map_err(|e| e.to_string())?;
+        let Some(text) = self.cipher.decrypt(&enc) else {
+            return Ok(None);
+        };
+        let created_at: i64 = row.get(1).map_err(|e| e.to_string())?;
+        Ok(Some(HistoryItem {
+            id: row.get(0).map_err(|e| e.to_string())?,
+            created_at: Utc
+                .timestamp_opt(created_at, 0)
+                .single()
+                .unwrap_or_else(Utc::now)
+                .to_rfc3339(),
+            text,
+            source: row.get(3).map_err(|e| e.to_string())?,
+            latency_ms: row.get(4).map_err(|e| e.to_string())?,
+            word_count: row.get::<_, i64>(5).map_err(|e| e.to_string())? as usize,
+            char_count: row.get::<_, i64>(6).map_err(|e| e.to_string())? as usize,
+            dictionary_applied: row.get::<_, i64>(7).map_err(|e| e.to_string())? != 0,
+            snippet_applied: row.get::<_, i64>(8).map_err(|e| e.to_string())? != 0,
+        }))
+    }
 }
 
 fn ts_to_rfc3339(ts: i64) -> String {
@@ -617,4 +689,104 @@ fn new_id(prefix: &str) -> String {
         Utc::now().timestamp_micros(),
         rand::random::<u32>()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{new_id, LocalStore};
+    use chrono::Utc;
+    use rusqlite::params;
+    use std::path::PathBuf;
+
+    fn temp_db_path(test_name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dictum-storage-test-{test_name}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        path
+    }
+
+    fn seed_history(store: &LocalStore, text: &str, latency_ms: i64, created_at: i64) {
+        let conn = store.open().expect("open store");
+        let text_enc = store.cipher.encrypt(text).expect("encrypt");
+        let word_count = text.split_whitespace().count() as i64;
+        let char_count = text.chars().count() as i64;
+        conn.execute(
+            r#"
+            INSERT INTO dictation_history
+            (id, created_at, text_enc, source, latency_ms, word_count, char_count, dictionary_applied, snippet_applied)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)
+            "#,
+            params![
+                new_id("hist"),
+                created_at,
+                text_enc,
+                "local",
+                latency_ms,
+                word_count,
+                char_count
+            ],
+        )
+            .expect("insert history");
+    }
+
+    #[test]
+    fn get_history_pages_without_query_in_sql_order() {
+        let db_path = temp_db_path("history-page");
+        let store = LocalStore::new(db_path.clone()).expect("create store");
+        let base = Utc::now().timestamp();
+        seed_history(&store, "first entry", 10, base - 2);
+        seed_history(&store, "second entry", 20, base - 1);
+        seed_history(&store, "third entry", 30, base);
+
+        let page = store.get_history(1, 2, None).expect("get history");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].text, "third entry");
+        assert_eq!(page.items[1].text, "second entry");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn get_history_query_filters_matches_without_loading_all_items() {
+        let db_path = temp_db_path("history-query");
+        let store = LocalStore::new(db_path.clone()).expect("create store");
+        let base = Utc::now().timestamp();
+        seed_history(&store, "alpha bravo", 10, base - 2);
+        seed_history(&store, "charlie delta", 20, base - 1);
+        seed_history(&store, "echo alpha", 30, base);
+
+        let page = store
+            .get_history(1, 10, Some("alpha".into()))
+            .expect("query history");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().all(|item| item.text.contains("alpha")));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn get_stats_aggregates_in_sql() {
+        let db_path = temp_db_path("stats");
+        let store = LocalStore::new(db_path.clone()).expect("create store");
+        let base = Utc::now().timestamp();
+        seed_history(&store, "one two", 100, base - 1);
+        seed_history(&store, "three four five", 200, base);
+
+        let stats = store.get_stats(30).expect("get stats");
+        assert_eq!(stats.total_utterances, 2);
+        assert_eq!(stats.total_words, 5);
+        assert_eq!(
+            stats.total_chars,
+            "one two".chars().count() + "three four five".chars().count()
+        );
+        assert_eq!(stats.buckets.len(), 1);
+        assert!(stats.avg_latency_ms >= 100.0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }

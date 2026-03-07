@@ -1,0 +1,105 @@
+{
+  "fixtures_dir": "benchmarks/fixtures",
+  "iterations": 1,
+  "total_runs": 4,
+  "total_files": 4,
+  "p50_latency_ms": 22765.8497,
+  "p95_latency_ms": 27069.9318,
+  "avg_latency_ms": 17628.7173,
+  "miss_rate": 0.0,
+  "placeholder_rate": 0.0,
+  "avg_confidence": 0.795,
+  "avg_similarity_to_expected": 0.76666665,
+  "categories": [
+    {
+      "category": "long_form",
+      "runs": 1,
+      "p50_latency_ms": 27069.9318,
+      "p95_latency_ms": 27069.9318,
+      "avg_latency_ms": 27069.9318,
+      "miss_rate": 0.0,
+      "placeholder_rate": 0.0,
+      "avg_confidence": 0.88,
+      "avg_similarity_to_expected": 1.0
+    },
+    {
+      "category": "noisy_room",
+      "runs": 1,
+      "p50_latency_ms": 22765.8497,
+      "p95_latency_ms": 22765.8497,
+      "avg_latency_ms": 22765.8497,
+      "miss_rate": 0.0,
+      "placeholder_rate": 0.0,
+      "avg_confidence": 0.88,
+      "avg_similarity_to_expected": null
+    },
+    {
+      "category": "quiet_speech",
+      "runs": 1,
+      "p50_latency_ms": 10359.258300000001,
+      "p95_latency_ms": 10359.258300000001,
+      "avg_latency_ms": 10359.258300000001,
+      "miss_rate": 0.0,
+      "placeholder_rate": 0.0,
+      "avg_confidence": 0.71999997,
+      "avg_similarity_to_expected": 0.3
+    },
+    {
+      "category": "whisper_speech",
+      "runs": 1,
+      "p50_latency_ms": 10319.8294,
+      "p95_latency_ms": 10319.8294,
+      "avg_latency_ms": 10319.8294,
+      "miss_rate": 0.0,
+      "placeholder_rate": 0.0,
+      "avg_confidence": 0.7,
+      "avg_similarity_to_expected": 1.0
+    }
+  ],
+  "cases": [
+    {
+      "file": "long_form\\long_paragraph.wav",
+      "category": "long_form",
+      "iteration": 1,
+      "latency_ms": 27069.9318,
+      "text_len": 194,
+      "confidence": 0.88,
+      "is_empty": false,
+      "used_placeholder": false,
+      "similarity_to_expected": 1.0
+    },
+    {
+      "file": "noisy_room\\noisy_intro.wav",
+      "category": "noisy_room",
+      "iteration": 1,
+      "latency_ms": 22765.8497,
+      "text_len": 357,
+      "confidence": 0.88,
+      "is_empty": false,
+      "used_placeholder": false,
+      "similarity_to_expected": null
+    },
+    {
+      "file": "quiet_speech\\quiet_intro.wav",
+      "category": "quiet_speech",
+      "iteration": 1,
+      "latency_ms": 10359.258300000001,
+      "text_len": 125,
+      "confidence": 0.71999997,
+      "is_empty": false,
+      "used_placeholder": false,
+      "similarity_to_expected": 0.3
+    },
+    {
+      "file": "whisper_speech\\whisper_intro.wav",
+      "category": "whisper_speech",
+      "iteration": 1,
+      "latency_ms": 10319.8294,
+      "text_len": 64,
+      "confidence": 0.7,
+      "is_empty": false,
+      "used_placeholder": false,
+      "similarity_to_expected": 1.0
+    }
+  ]
+}

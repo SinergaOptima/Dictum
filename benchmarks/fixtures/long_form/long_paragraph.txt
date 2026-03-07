@@ -1,0 +1,1 @@
+Long form benchmark. Dictum should remain stable across a longer paragraph of dictated text with multiple clauses and a natural speaking rhythm for testing latency quality and fallback behavior.

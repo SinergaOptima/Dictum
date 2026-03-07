@@ -318,6 +318,8 @@ export interface AppDiagnostics {
   injectSuccess: number;
   finalSegmentsSeen: number;
   fallbackStubTyped: number;
+  duplicateFinalSuppressed: number;
+  partialRescuesUsed: number;
   shortcutToggleExecuted: number;
   shortcutToggleDropped: number;
   pipelineFramesIn: number;
@@ -328,12 +330,37 @@ export interface AppDiagnostics {
   pipelineInferenceErrors: number;
   pipelineSegmentsEmitted: number;
   pipelineFallbackEmitted: number;
+  pipelineDrainMs: PerfStageSnapshot;
+  pipelineResampleMs: PerfStageSnapshot;
+  pipelineVadMs: PerfStageSnapshot;
+  pipelineInferenceMs: PerfStageSnapshot;
 }
 
 export interface PerfSnapshot {
   diagnostics: AppDiagnostics;
+  drainMs: PerfStageSnapshot;
+  resampleMs: PerfStageSnapshot;
+  vadMs: PerfStageSnapshot;
+  inferenceMs: PerfStageSnapshot;
   transformMs: PerfStageSnapshot;
   injectMs: PerfStageSnapshot;
   persistMs: PerfStageSnapshot;
   finalizeMs: PerfStageSnapshot;
+}
+
+export interface DiagnosticsBundle {
+  generatedAt: string;
+  appVersion: string;
+  updateRepoSlug: string;
+  settingsPath: string;
+  runtimeSettings: RuntimeSettings;
+  privacySettings: PrivacySettings;
+  perfSnapshot: PerfSnapshot;
+  historyStorage: {
+    dbPath: string;
+    totalRecords: number;
+    oldestCreatedAt: string | null;
+    newestCreatedAt: string | null;
+  };
+  devices: DeviceInfo[];
 }

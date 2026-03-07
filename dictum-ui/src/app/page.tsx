@@ -23,6 +23,7 @@ import {
   deleteHistory,
   deleteSnippet,
   getDictionary,
+  getDiagnosticsBundle,
   getHistory,
   getLearnedCorrections,
   getModelProfileCatalog,
@@ -839,6 +840,42 @@ export default function Home() {
     }
   }, [updateTelemetry]);
 
+  const handleCopyDiagnosticsBundle = useCallback(async () => {
+    try {
+      const bundle = await getDiagnosticsBundle();
+      const exportPayload = {
+        ...bundle,
+        uiDiagnostics: {
+          copiedAt: new Date().toISOString(),
+          updateTelemetry,
+          updateState: {
+            repoSlug: updateRepoSlug.trim() || DEFAULT_UPDATE_REPO,
+            autoCheckEnabled: updateAutoCheckEnabled,
+            autoInstallWhenIdle: updateAutoInstallWhenIdle,
+            skipVersion: updateSkipVersion,
+            remindUntilMs: updateRemindUntilMs,
+            lastCheckedAt: updateLastCheckedAt,
+            currentUpdate: updateInfo,
+          },
+        },
+      };
+      await navigator.clipboard.writeText(JSON.stringify(exportPayload, null, 2));
+      setRuntimeMsg("Copied diagnostics bundle to clipboard.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to copy diagnostics bundle: ${msg}`);
+    }
+  }, [
+    updateAutoCheckEnabled,
+    updateAutoInstallWhenIdle,
+    updateInfo,
+    updateLastCheckedAt,
+    updateRemindUntilMs,
+    updateRepoSlug,
+    updateSkipVersion,
+    updateTelemetry,
+  ]);
+
   useEffect(() => {
     if (!updateAutoCheckEnabled || autoUpdateCheckedRef.current) return;
     if (showOnboarding) return;
@@ -1475,6 +1512,9 @@ export default function Home() {
     ? (perfSnapshot.diagnostics.fallbackStubTyped / perfSnapshot.diagnostics.finalSegmentsSeen) * 100
     : 0;
   const finalizeP95 = perfSnapshot?.finalizeMs.p95Ms ?? 0;
+  const inferenceP95 = perfSnapshot?.inferenceMs.p95Ms ?? 0;
+  const duplicateFinalSuppressed = perfSnapshot?.diagnostics.duplicateFinalSuppressed ?? 0;
+  const partialRescuesUsed = perfSnapshot?.diagnostics.partialRescuesUsed ?? 0;
   const nowMs = Date.now();
   const updateIsSkipped = !!(updateInfo?.hasUpdate && updateSkipVersion && updateInfo.latestVersion === updateSkipVersion);
   const updateIsSnoozed = !!(updateInfo?.hasUpdate && updateRemindUntilMs > nowMs);
@@ -1811,6 +1851,9 @@ export default function Home() {
                 <button className="action-btn" onClick={() => void refreshStats(true)} disabled={panelLoading.stats}>
                   {panelLoading.stats ? "Refreshing..." : "Refresh"}
                 </button>
+                <button className="action-btn" onClick={() => void handleCopyDiagnosticsBundle()}>
+                  Copy Diagnostics
+                </button>
               </div>
               {panelLoading.stats && !stats ? (
                 <div className="empty-slate">
@@ -1845,6 +1888,15 @@ export default function Home() {
                   </motion.div>
                   <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
                     <b>{Math.round(finalizeP95)} ms</b><span>Finalize p95</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{Math.round(inferenceP95)} ms</b><span>Inference p95</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{duplicateFinalSuppressed}</b><span>Duplicate Finals Blocked</span>
+                  </motion.div>
+                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                    <b>{partialRescuesUsed}</b><span>Partial Rescues</span>
                   </motion.div>
                 </motion.div>
               ) : (

@@ -1,0 +1,1 @@
+Noisy room benchmark. Background sound should not block the transcript.

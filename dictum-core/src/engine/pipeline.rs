@@ -49,6 +49,10 @@ pub struct PipelineDiagnostics {
     pub inference_errors: AtomicUsize,
     pub segments_emitted: AtomicUsize,
     pub fallback_emitted: AtomicUsize,
+    drain_ms: Mutex<StageWindow>,
+    resample_ms: Mutex<StageWindow>,
+    vad_ms: Mutex<StageWindow>,
+    inference_ms: Mutex<StageWindow>,
 }
 
 impl Default for PipelineDiagnostics {
@@ -62,6 +66,10 @@ impl Default for PipelineDiagnostics {
             inference_errors: AtomicUsize::new(0),
             segments_emitted: AtomicUsize::new(0),
             fallback_emitted: AtomicUsize::new(0),
+            drain_ms: Mutex::new(StageWindow::default()),
+            resample_ms: Mutex::new(StageWindow::default()),
+            vad_ms: Mutex::new(StageWindow::default()),
+            inference_ms: Mutex::new(StageWindow::default()),
         }
     }
 }
@@ -76,6 +84,26 @@ impl PipelineDiagnostics {
         self.inference_errors.store(0, Ordering::Relaxed);
         self.segments_emitted.store(0, Ordering::Relaxed);
         self.fallback_emitted.store(0, Ordering::Relaxed);
+        self.drain_ms.lock().clear();
+        self.resample_ms.lock().clear();
+        self.vad_ms.lock().clear();
+        self.inference_ms.lock().clear();
+    }
+
+    pub fn record_drain(&self, elapsed_ms: f64) {
+        self.drain_ms.lock().record(elapsed_ms);
+    }
+
+    pub fn record_resample(&self, elapsed_ms: f64) {
+        self.resample_ms.lock().record(elapsed_ms);
+    }
+
+    pub fn record_vad(&self, elapsed_ms: f64) {
+        self.vad_ms.lock().record(elapsed_ms);
+    }
+
+    pub fn record_inference(&self, elapsed_ms: f64) {
+        self.inference_ms.lock().record(elapsed_ms);
     }
 
     pub fn snapshot(&self) -> DiagnosticsSnapshot {
@@ -88,6 +116,10 @@ impl PipelineDiagnostics {
             inference_errors: self.inference_errors.load(Ordering::Relaxed),
             segments_emitted: self.segments_emitted.load(Ordering::Relaxed),
             fallback_emitted: self.fallback_emitted.load(Ordering::Relaxed),
+            drain_ms: self.drain_ms.lock().snapshot(),
+            resample_ms: self.resample_ms.lock().snapshot(),
+            vad_ms: self.vad_ms.lock().snapshot(),
+            inference_ms: self.inference_ms.lock().snapshot(),
         }
     }
 }
@@ -102,6 +134,105 @@ pub struct DiagnosticsSnapshot {
     pub inference_errors: usize,
     pub segments_emitted: usize,
     pub fallback_emitted: usize,
+    pub drain_ms: StageTimingSnapshot,
+    pub resample_ms: StageTimingSnapshot,
+    pub vad_ms: StageTimingSnapshot,
+    pub inference_ms: StageTimingSnapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StageTimingSnapshot {
+    pub count: usize,
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+#[derive(Debug)]
+struct StageWindow {
+    samples: Vec<f64>,
+    cap: usize,
+    count: usize,
+    sum_ms: f64,
+    max_ms: f64,
+}
+
+impl Default for StageWindow {
+    fn default() -> Self {
+        Self {
+            samples: Vec::with_capacity(512),
+            cap: 512,
+            count: 0,
+            sum_ms: 0.0,
+            max_ms: 0.0,
+        }
+    }
+}
+
+impl StageWindow {
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.count = 0;
+        self.sum_ms = 0.0;
+        self.max_ms = 0.0;
+    }
+
+    fn record(&mut self, elapsed_ms: f64) {
+        let value = if elapsed_ms.is_finite() {
+            elapsed_ms.max(0.0)
+        } else {
+            0.0
+        };
+        if self.samples.len() == self.cap {
+            let _ = self.samples.remove(0);
+        }
+        self.samples.push(value);
+        self.count = self.count.saturating_add(1);
+        self.sum_ms += value;
+        if value > self.max_ms {
+            self.max_ms = value;
+        }
+    }
+
+    fn snapshot(&self) -> StageTimingSnapshot {
+        if self.samples.is_empty() {
+            return StageTimingSnapshot {
+                count: 0,
+                mean_ms: 0.0,
+                p50_ms: 0.0,
+                p95_ms: 0.0,
+                p99_ms: 0.0,
+                max_ms: 0.0,
+            };
+        }
+
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+
+        let percentile = |p: f64| -> f64 {
+            let n = sorted.len();
+            if n == 1 {
+                return sorted[0];
+            }
+            let idx = ((n - 1) as f64 * p).round() as usize;
+            sorted[idx.min(n - 1)]
+        };
+
+        StageTimingSnapshot {
+            count: self.count,
+            mean_ms: if self.count == 0 {
+                0.0
+            } else {
+                self.sum_ms / self.count as f64
+            },
+            p50_ms: percentile(0.50),
+            p95_ms: percentile(0.95),
+            p99_ms: percentile(0.99),
+            max_ms: self.max_ms,
+        }
+    }
 }
 
 /// All context the pipeline needs, passed as one struct so the closure stays tidy.
@@ -194,7 +325,10 @@ pub fn run(mut ctx: PipelineContext) {
         }
 
         // ── 1. Drain ring buffer ──────────────────────────────────────────
+        let drain_started = Instant::now();
         let n = ctx.consumer.pop_slice(&mut raw);
+        ctx.diagnostics
+            .record_drain(drain_started.elapsed().as_secs_f64() * 1000.0);
 
         if n == 0 {
             // Nothing to process — yield to avoid burning 100 % CPU
@@ -205,7 +339,10 @@ pub fn run(mut ctx: PipelineContext) {
         ctx.diagnostics.frames_in.fetch_add(n, Ordering::Relaxed);
 
         // ── 2. Resample to target rate ────────────────────────────────────
+        let resample_started = Instant::now();
         let resampled = resampler.process(&raw[..n]);
+        ctx.diagnostics
+            .record_resample(resample_started.elapsed().as_secs_f64() * 1000.0);
         if resampled.is_empty() {
             // Partial chunk — waiting for more data to fill rubato's input buffer
             continue;
@@ -233,7 +370,10 @@ pub fn run(mut ctx: PipelineContext) {
         if rms >= ctx.config.vad_threshold {
             rms_active_samples = rms_active_samples.saturating_add(chunk.samples.len());
         }
+        let vad_started = Instant::now();
         let decision = ctx.vad.classify(&chunk);
+        ctx.diagnostics
+            .record_vad(vad_started.elapsed().as_secs_f64() * 1000.0);
         let is_speech = matches!(decision, VadDecision::Speech);
         if is_speech {
             ctx.diagnostics.vad_speech.fetch_add(1, Ordering::Relaxed);
@@ -492,7 +632,11 @@ fn flush_inference(
 
     let mut segments = {
         let mut model = ctx.model.0.lock();
-        match model.transcribe(&chunk, partial) {
+        let inference_started = Instant::now();
+        let result = model.transcribe(&chunk, partial);
+        ctx.diagnostics
+            .record_inference(inference_started.elapsed().as_secs_f64() * 1000.0);
+        match result {
             Ok(segs) => segs,
             Err(e) => {
                 ctx.diagnostics
