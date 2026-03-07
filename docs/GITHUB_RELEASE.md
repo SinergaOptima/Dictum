@@ -38,6 +38,8 @@ If these are not present, release artifacts are built but not Authenticode-signe
 
 ## 3) Trigger release
 
+Internal dev builds should use prerelease versions such as `0.1.8-dev.1` through `0.1.8-dev.5` and should not be tagged or published to GitHub Releases unless explicitly intended as a prerelease artifact.
+
 Option A: Push a version tag (auto release upload):
 
 ```powershell
@@ -69,6 +71,7 @@ Before cutting a public release, verify all of the following locally or in CI:
 - the updater default repo slug is `sinergaoptima/dictum` in both frontend and backend
 - `SHA256SUMS.txt` contains entries for both the installer and `dictum.exe`
 - the installer passes Authenticode verification after build
+- the workflow verifies signatures with `signtool verify`, not only `Get-AuthenticodeSignature`
 
 ## 6) Updater smoke test checklist
 
@@ -87,3 +90,4 @@ Run these from the previous public installer, not only from a local dev build:
 - Use a canary release or manual workflow run after any signing workflow change.
 - Treat unexpected workflow warnings as release blockers until they are understood or explicitly waived.
 - Keep rollback notes for at least one previous public version in the GitHub release body.
+- Prefer `signtool verify /pa` as the release gate; use `Get-AuthenticodeSignature` mainly for signer metadata inspection.

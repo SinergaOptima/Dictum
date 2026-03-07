@@ -98,6 +98,7 @@ jobs:
           if (-not $signtool) {
             throw "signtool.exe not found on runner."
           }
+          "signtool_path=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.exe_path }}"
           if ($LASTEXITCODE -ne 0) { throw "Failed to sign dictum.exe" }
           & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 "${{ steps.artifacts.outputs.installer_path }}"
@@ -115,14 +116,22 @@ jobs:
         env:
           WINDOWS_CERT_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERT_EXPECTED_SUBJECT }}
         run: |
+          $signtool = "${{ steps.sign_step.outputs.signtool_path }}"
+          if ([string]::IsNullOrWhiteSpace($signtool) -or -not (Test-Path $signtool)) {
+            throw "signtool path missing from signing step output."
+          }
           $files = @(
             "${{ steps.artifacts.outputs.exe_path }}",
             "${{ steps.artifacts.outputs.installer_path }}"
           )
           foreach ($file in $files) {
+            & $signtool verify /pa /v $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verification failed for $file"
+            }
             $sig = Get-AuthenticodeSignature $file
-            if ($sig.Status -ne "Valid") {
-              throw "Authenticode signature invalid for $file (status=$($sig.Status))"
+            if (-not $sig.SignerCertificate) {
+              throw "Authenticode signature missing signer certificate for $file (status=$($sig.Status))"
             }
             $subject = $sig.SignerCertificate.Subject
             if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_EXPECTED_SUBJECT) -and $subject -notmatch [regex]::Escape($env:WINDOWS_CERT_EXPECTED_SUBJECT)) {

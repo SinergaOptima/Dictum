@@ -7,6 +7,8 @@ import { useEngine } from "@/hooks/useEngine";
 import { useTranscript } from "@/hooks/useTranscript";
 import type {
   AppUpdateInfo,
+  ActiveAppContext,
+  AppProfile,
   DictionaryEntry,
   HistoryItem,
   LearnedCorrection,
@@ -22,7 +24,10 @@ import {
   deleteDictionary,
   deleteHistory,
   deleteSnippet,
+  deleteAppProfile,
   getDictionary,
+  getActiveAppContext,
+  getAppProfiles,
   getDiagnosticsBundle,
   getHistory,
   getLearnedCorrections,
@@ -42,6 +47,7 @@ import {
   downloadAndInstallAppUpdate,
   setPreferredInputDevice,
   setRuntimeSettings,
+  upsertAppProfile,
   upsertDictionary,
   upsertSnippet,
 } from "@/lib/tauri";
@@ -49,6 +55,7 @@ import { motion, AnimatePresence } from "framer-motion";
 
 type Tab = "live" | "history" | "stats" | "dictionary" | "snippets" | "settings";
 type CloudMode = "local_only" | "hybrid" | "cloud_preferred";
+type DictationMode = "conversation" | "coding" | "command";
 type UpdateCheckOptions = {
   silent?: boolean;
   ignoreDeferrals?: boolean;
@@ -157,6 +164,18 @@ type MicCalibration = {
   activityNoiseGate: number;
   activityClipThreshold: number;
   inputGainBoost: number;
+  guidedTuneVersion?: number;
+  calibratedAt?: string;
+};
+
+type GuidedTuneStage = {
+  key: string;
+  mode: "ambient" | "normal" | "whisper";
+  label: string;
+  instruction: string;
+  sentence?: string;
+  prepMs?: number;
+  captureMs: number;
 };
 
 const clamp = (v: number, min: number, max: number): number => Math.min(max, Math.max(min, v));
@@ -183,6 +202,124 @@ const jaccardSimilarity = (a: string, b: string): number => {
   });
   const union = aSet.size + bSet.size - intersection;
   return union <= 0 ? 0 : intersection / union;
+};
+
+const inferCorrectionModeAffinity = (corrected: string, mode: DictationMode): number => {
+  const text = corrected.trim();
+  if (!text) return 0;
+  const hasCodeSymbols = /[_/\\()[\]{}:=;`."'-]/.test(text);
+  const hasCamelOrPascal = /[a-z][A-Z]|[A-Z][a-z]+[A-Z]/.test(text);
+  const hasDashOrSlash = /[-/]/.test(text);
+  const isMostlyLower = text === text.toLowerCase();
+  const hasSpaces = /\s/.test(text);
+
+  switch (mode) {
+    case "coding":
+      return (
+        (hasCodeSymbols ? 0.55 : 0) +
+        (hasCamelOrPascal ? 0.28 : 0) +
+        (!hasSpaces ? 0.12 : 0)
+      );
+    case "command":
+      return (
+        (hasDashOrSlash ? 0.45 : 0) +
+        (isMostlyLower ? 0.24 : 0) +
+        (!hasSpaces ? 0.12 : 0)
+      );
+    default:
+      return (
+        (hasSpaces ? 0.2 : 0) +
+        (!hasCodeSymbols ? 0.14 : 0) +
+        (/^[A-Z]/.test(text) ? 0.08 : 0)
+      );
+  }
+};
+
+const GUIDED_TUNE_VERSION = 2;
+const GUIDED_TUNE_TOTAL_MS = 30_000;
+const GUIDED_TUNE_STAGES: GuidedTuneStage[] = [
+  {
+    key: "ambient",
+    mode: "ambient",
+    label: "Room Tone",
+    instruction: "Stay quiet for a few seconds so Dictum can hear the room.",
+    captureMs: 4_000,
+  },
+  {
+    key: "normal_one",
+    mode: "normal",
+    label: "Normal Voice 1",
+    instruction: "Read this at your normal speaking volume.",
+    sentence: "Dictum should catch my normal voice in a steady speaking rhythm.",
+    prepMs: 1_000,
+    captureMs: 5_000,
+  },
+  {
+    key: "whisper_one",
+    mode: "whisper",
+    label: "Whisper Voice 1",
+    instruction: "Now whisper this sentence softly but clearly.",
+    sentence: "Even when I whisper, I want the transcript to stay reliable and clear.",
+    prepMs: 1_000,
+    captureMs: 5_000,
+  },
+  {
+    key: "normal_two",
+    mode: "normal",
+    label: "Normal Voice 2",
+    instruction: "One more normal-volume sentence.",
+    sentence: "This second sample helps tune both stability and speed for everyday dictation.",
+    prepMs: 1_000,
+    captureMs: 5_000,
+  },
+  {
+    key: "whisper_two",
+    mode: "whisper",
+    label: "Whisper Voice 2",
+    instruction: "Finish with one more whisper sample.",
+    sentence: "Quiet speech should still trigger dictation without forcing me to speak loudly.",
+    prepMs: 1_000,
+    captureMs: 5_000,
+  },
+];
+
+const DICTATION_MODE_OPTIONS: Array<{ value: DictationMode; label: string; hint: string }> = [
+  {
+    value: "conversation",
+    label: "Conversation",
+    hint: "Sentence-style cleanup for natural prose and messages.",
+  },
+  {
+    value: "coding",
+    label: "Coding",
+    hint: "Maps common spoken symbol phrases and avoids sentence punctuation.",
+  },
+  {
+    value: "command",
+    label: "Command",
+    hint: "Lowercases commands, trims punctuation, and favors shell-style text.",
+  },
+];
+
+const loadCalibrationProfiles = (): Record<string, MicCalibration> => {
+  try {
+    const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, MicCalibration>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveCalibrationProfile = (deviceName: string, profile: MicCalibration): void => {
+  try {
+    const all = loadCalibrationProfiles();
+    all[deviceName] = profile;
+    localStorage.setItem(MIC_CALIBRATION_STORAGE_KEY, JSON.stringify(all));
+  } catch {
+    // Ignore local storage errors.
+  }
 };
 
 export default function Home() {
@@ -213,6 +350,7 @@ export default function Home() {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [modelProfile, setModelProfile] = useState("distil-large-v3");
   const [performanceProfile, setPerformanceProfile] = useState("whisper_balanced_english");
+  const [dictationMode, setDictationMode] = useState<DictationMode>("conversation");
   const [toggleShortcut, setToggleShortcut] = useState("Ctrl+Shift+Space");
   const [ortEp, setOrtEp] = useState("auto");
   const [ortIntraThreads, setOrtIntraThreads] = useState(0);
@@ -236,6 +374,11 @@ export default function Home() {
   const [calibrationMsg, setCalibrationMsg] = useState<string | null>(null);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [isBenchmarkTuning, setIsBenchmarkTuning] = useState(false);
+  const [guidedTuneStepLabel, setGuidedTuneStepLabel] = useState<string | null>(null);
+  const [guidedTuneInstruction, setGuidedTuneInstruction] = useState<string | null>(null);
+  const [guidedTuneSentence, setGuidedTuneSentence] = useState<string | null>(null);
+  const [guidedTuneProgressPct, setGuidedTuneProgressPct] = useState(0);
+  const [guidedTuneCompletedForDevice, setGuidedTuneCompletedForDevice] = useState(false);
   const [updateRepoSlug, setUpdateRepoSlug] = useState(DEFAULT_UPDATE_REPO);
   const [currentAppVersion, setCurrentAppVersion] = useState<string>("dev");
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
@@ -250,11 +393,23 @@ export default function Home() {
   const [updateLogCopied, setUpdateLogCopied] = useState<"idle" | "done" | "error">("idle");
   const [activeFixSegmentId, setActiveFixSegmentId] = useState<string | null>(null);
   const [activeFixText, setActiveFixText] = useState("");
+  const [correctionsCopied, setCorrectionsCopied] = useState<"idle" | "done" | "error">("idle");
+  const [correctionsImportText, setCorrectionsImportText] = useState("");
+  const [correctionFilter, setCorrectionFilter] = useState("");
 
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [stats, setStats] = useState<StatsPayload | null>(null);
   const [perfSnapshot, setPerfSnapshot] = useState<PerfSnapshot | null>(null);
+  const [appProfiles, setAppProfiles] = useState<AppProfile[]>([]);
+  const [activeAppContext, setActiveAppContext] = useState<ActiveAppContext | null>(null);
+  const [appProfileName, setAppProfileName] = useState("");
+  const [appProfileMatch, setAppProfileMatch] = useState("");
+  const [appProfileMode, setAppProfileMode] = useState<DictationMode>("coding");
+  const [appProfileBiasTerms, setAppProfileBiasTerms] = useState("");
+  const [appProfileRefine, setAppProfileRefine] = useState(false);
+  const [appProfilesCopied, setAppProfilesCopied] = useState<"idle" | "done" | "error">("idle");
+  const [appProfilesImportText, setAppProfilesImportText] = useState("");
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
   const [snippets, setSnippets] = useState<SnippetEntry[]>([]);
   const [panelLoading, setPanelLoading] = useState<PanelLoadingState>({
@@ -304,6 +459,7 @@ export default function Home() {
         .slice(-6),
     [deferredSegments],
   );
+  const effectiveSuggestionMode = ((activeAppContext?.dictationMode || dictationMode) as DictationMode);
   const correctionSuggestions = useMemo(() => {
     const suggestions: Array<{
       id: string;
@@ -317,7 +473,11 @@ export default function Home() {
       for (const rule of learnedCorrections) {
         const sim = jaccardSimilarity(seg.text, rule.heard);
         const contains = seg.text.toLowerCase().includes(rule.heard.toLowerCase()) ? 1 : 0;
-        const weighted = (1 - segConf) * (1 + Math.min(rule.hits, 12) / 12) * (sim + contains * 0.4);
+        const modeAffinity = inferCorrectionModeAffinity(rule.corrected, effectiveSuggestionMode);
+        const weighted =
+          (1 - segConf) *
+          (1 + Math.min(rule.hits, 12) / 12) *
+          (sim + contains * 0.4 + modeAffinity);
         if (weighted < 0.18) continue;
         suggestions.push({
           id: `${seg.id}:${rule.heard}:${rule.corrected}`,
@@ -329,8 +489,17 @@ export default function Home() {
       }
     }
     suggestions.sort((a, b) => b.score - a.score);
-    return suggestions.slice(0, 5);
-  }, [learnedCorrections, lowConfidenceFinals]);
+    return suggestions.filter((item, index, arr) => arr.findIndex((other) => other.corrected === item.corrected) === index).slice(0, 5);
+  }, [effectiveSuggestionMode, learnedCorrections, lowConfidenceFinals]);
+  const filteredLearnedCorrections = useMemo(() => {
+    const query = correctionFilter.trim().toLowerCase();
+    if (!query) return learnedCorrections;
+    return learnedCorrections.filter(
+      (rule) =>
+        rule.heard.toLowerCase().includes(query) ||
+        rule.corrected.toLowerCase().includes(query),
+    );
+  }, [correctionFilter, learnedCorrections]);
 
   const appendUpdateTelemetry = useCallback((
     event: string,
@@ -507,6 +676,7 @@ export default function Home() {
       .then(([runtime, privacy]) => {
         setModelProfile(runtime.modelProfile || "distil-large-v3");
         setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
+        setDictationMode((runtime.dictationMode || "conversation") as DictationMode);
         setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(runtime.ortEp || "auto");
         setOrtIntraThreads(runtime.ortIntraThreads ?? 0);
@@ -548,6 +718,30 @@ export default function Home() {
       .then((rules) => setLearnedCorrections(rules))
       .catch((err) => console.warn("Could not fetch learned corrections:", err));
   }, []);
+
+  useEffect(() => {
+    getAppProfiles()
+      .then((profiles) => setAppProfiles(profiles))
+      .catch((err) => console.warn("Could not fetch app profiles:", err));
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "settings") return;
+    let cancelled = false;
+    const refresh = () => {
+      getActiveAppContext()
+        .then((context) => {
+          if (!cancelled) setActiveAppContext(context);
+        })
+        .catch((err) => console.warn("Could not fetch active app context:", err));
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tab]);
 
   useEffect(() => {
     setCloudOptIn(cloudMode !== "local_only");
@@ -603,27 +797,22 @@ export default function Home() {
 
   useEffect(() => {
     if (!selectedDeviceName) return;
-    try {
-      const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
-      if (!raw) return;
-      const all = JSON.parse(raw) as Record<string, MicCalibration>;
-      const profile = all[selectedDeviceName];
-      if (!profile) return;
-      setPillVisualizerSensitivity(profile.pillVisualizerSensitivity);
-      setActivitySensitivity(profile.activitySensitivity);
-      setActivityNoiseGate(profile.activityNoiseGate);
-      setActivityClipThreshold(profile.activityClipThreshold);
-      setInputGainBoost(profile.inputGainBoost);
-      void applyRuntime({
-        pillVisualizerSensitivity: profile.pillVisualizerSensitivity,
-        activitySensitivity: profile.activitySensitivity,
-        activityNoiseGate: profile.activityNoiseGate,
-        activityClipThreshold: profile.activityClipThreshold,
-        inputGainBoost: profile.inputGainBoost,
-      });
-    } catch {
-      // Ignore malformed local calibration cache.
-    }
+    const all = loadCalibrationProfiles();
+    const profile = all[selectedDeviceName];
+    setGuidedTuneCompletedForDevice((profile?.guidedTuneVersion ?? 0) >= GUIDED_TUNE_VERSION);
+    if (!profile) return;
+    setPillVisualizerSensitivity(profile.pillVisualizerSensitivity);
+    setActivitySensitivity(profile.activitySensitivity);
+    setActivityNoiseGate(profile.activityNoiseGate);
+    setActivityClipThreshold(profile.activityClipThreshold);
+    setInputGainBoost(profile.inputGainBoost);
+    void applyRuntime({
+      pillVisualizerSensitivity: profile.pillVisualizerSensitivity,
+      activitySensitivity: profile.activitySensitivity,
+      activityNoiseGate: profile.activityNoiseGate,
+      activityClipThreshold: profile.activityClipThreshold,
+      inputGainBoost: profile.inputGainBoost,
+    });
   }, [selectedDeviceName]);
 
   useEffect(() => {
@@ -637,6 +826,18 @@ export default function Home() {
     const timer = window.setTimeout(() => setUpdateLogCopied("idle"), 1600);
     return () => window.clearTimeout(timer);
   }, [updateLogCopied]);
+
+  useEffect(() => {
+    if (appProfilesCopied === "idle") return;
+    const timer = window.setTimeout(() => setAppProfilesCopied("idle"), 1600);
+    return () => window.clearTimeout(timer);
+  }, [appProfilesCopied]);
+
+  useEffect(() => {
+    if (correctionsCopied === "idle") return;
+    const timer = window.setTimeout(() => setCorrectionsCopied("idle"), 1600);
+    return () => window.clearTimeout(timer);
+  }, [correctionsCopied]);
 
   useEffect(() => {
     const markInteraction = () => {
@@ -966,6 +1167,131 @@ export default function Home() {
     }
   }, []);
 
+  const handleCopyCorrections = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(learnedCorrections, null, 2));
+      setCorrectionsCopied("done");
+      setRuntimeMsg("Copied learned corrections JSON to clipboard.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setCorrectionsCopied("error");
+      setRuntimeMsg(`Failed to copy learned corrections: ${msg}`);
+    }
+  }, [learnedCorrections]);
+
+  const handleImportCorrections = useCallback(async () => {
+    const raw = correctionsImportText.trim();
+    if (!raw) {
+      setRuntimeMsg("Paste learned corrections JSON first.");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as LearnedCorrection[];
+      if (!Array.isArray(parsed)) {
+        throw new Error("Expected a JSON array of learned corrections.");
+      }
+      let latest = learnedCorrections;
+      for (const rule of parsed) {
+        if (!rule?.heard || !rule?.corrected) continue;
+        latest = await learnCorrection(rule.heard, rule.corrected);
+      }
+      setLearnedCorrections(latest);
+      setCorrectionsImportText("");
+      setRuntimeMsg(`Imported ${parsed.length} learned correction${parsed.length === 1 ? "" : "s"}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to import learned corrections: ${msg}`);
+    }
+  }, [correctionsImportText, learnedCorrections]);
+
+  const handleSaveAppProfile = useCallback(async () => {
+    const name = appProfileName.trim();
+    const appMatch = appProfileMatch.trim().toLowerCase();
+    if (!name || !appMatch) {
+      setRuntimeMsg("Enter both a profile name and an app executable match.");
+      return;
+    }
+    try {
+      const profiles = await upsertAppProfile({
+        id: crypto.randomUUID(),
+        name,
+        appMatch,
+        dictationMode: appProfileMode,
+        phraseBiasTerms: appProfileBiasTerms
+          .split(/\r?\n|,/)
+          .map((term) => term.trim())
+          .filter(Boolean),
+        postUtteranceRefine: appProfileRefine,
+        enabled: true,
+      });
+      setAppProfiles(profiles);
+      setAppProfileName("");
+      setAppProfileMatch("");
+      setAppProfileMode("coding");
+      setAppProfileBiasTerms("");
+      setAppProfileRefine(false);
+      setRuntimeMsg(`Saved app profile for ${appMatch}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to save app profile: ${msg}`);
+    }
+  }, [appProfileBiasTerms, appProfileMatch, appProfileMode, appProfileName, appProfileRefine]);
+
+  const handleDeleteAppProfile = useCallback(async (id: string, name: string) => {
+    try {
+      const profiles = await deleteAppProfile(id);
+      setAppProfiles(profiles);
+      setRuntimeMsg(`Removed app profile "${name}".`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to delete app profile: ${msg}`);
+    }
+  }, []);
+
+  const handleCopyAppProfiles = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(appProfiles, null, 2));
+      setAppProfilesCopied("done");
+      setRuntimeMsg("Copied app profiles JSON to clipboard.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppProfilesCopied("error");
+      setRuntimeMsg(`Failed to copy app profiles: ${msg}`);
+    }
+  }, [appProfiles]);
+
+  const handleImportAppProfiles = useCallback(async () => {
+    const raw = appProfilesImportText.trim();
+    if (!raw) {
+      setRuntimeMsg("Paste exported app profiles JSON first.");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as AppProfile[];
+      if (!Array.isArray(parsed)) {
+        throw new Error("Expected a JSON array of app profiles.");
+      }
+      let latest = appProfiles;
+      for (const profile of parsed) {
+        latest = await upsertAppProfile({
+          id: profile.id || crypto.randomUUID(),
+          name: profile.name,
+          appMatch: profile.appMatch,
+          dictationMode: profile.dictationMode,
+          phraseBiasTerms: profile.phraseBiasTerms || [],
+          postUtteranceRefine: profile.postUtteranceRefine ?? false,
+          enabled: profile.enabled ?? true,
+        });
+      }
+      setAppProfiles(latest);
+      setAppProfilesImportText("");
+      setRuntimeMsg(`Imported ${parsed.length} app profile${parsed.length === 1 ? "" : "s"}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to import app profiles: ${msg}`);
+    }
+  }, [appProfiles, appProfilesImportText]);
+
   const startInlineFix = useCallback((segmentId: string, heardText: string) => {
     setActiveFixSegmentId(segmentId);
     setActiveFixText(heardText.trim());
@@ -1025,6 +1351,7 @@ export default function Home() {
     async (overrides?: Partial<{
       modelProfile: string;
       performanceProfile: string;
+      dictationMode: DictationMode;
       toggleShortcut: string;
       ortEp: string;
       ortIntraThreads: number;
@@ -1049,6 +1376,7 @@ export default function Home() {
       const next = {
         modelProfile,
         performanceProfile,
+        dictationMode,
         toggleShortcut,
         ortEp,
         ortIntraThreads,
@@ -1081,6 +1409,7 @@ export default function Home() {
         const updated = await setRuntimeSettings(
           next.modelProfile,
           next.performanceProfile,
+          next.dictationMode,
           next.toggleShortcut,
           next.ortEp,
           next.ortIntraThreads,
@@ -1104,6 +1433,7 @@ export default function Home() {
         );
         setModelProfile(updated.modelProfile || "distil-large-v3");
         setPerformanceProfile(updated.performanceProfile || "whisper_balanced_english");
+        setDictationMode((updated.dictationMode || "conversation") as DictationMode);
         setToggleShortcut(updated.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(updated.ortEp || "auto");
         setOrtIntraThreads(updated.ortIntraThreads ?? 0);
@@ -1142,6 +1472,7 @@ export default function Home() {
     [
       modelProfile,
       performanceProfile,
+      dictationMode,
       toggleShortcut,
       ortEp,
       ortIntraThreads,
@@ -1179,91 +1510,145 @@ export default function Home() {
     return samples;
   }, []);
 
+  const sleep = useCallback((durationMs: number) => {
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, durationMs);
+    });
+  }, []);
+
   const completeOnboarding = useCallback(async () => {
+    if (!guidedTuneCompletedForDevice) {
+      setCalibrationMsg("Run the guided voice tune before finishing setup. It takes about 30 seconds.");
+      return;
+    }
     const ok = await applyRuntime({ onboardingCompleted: true });
     if (!ok) {
       return;
     }
     setShowOnboarding(false);
     setRuntimeMsg("Onboarding complete.");
-  }, [applyRuntime]);
+  }, [applyRuntime, guidedTuneCompletedForDevice]);
 
   const runMicCalibration = useCallback(async () => {
     if (isCalibrating) return;
     setIsCalibrating(true);
-    setCalibrationMsg("Ambient phase: stay silent...");
+    setGuidedTuneProgressPct(0);
+    setGuidedTuneStepLabel("Preparing");
+    setGuidedTuneInstruction("Starting guided voice tune...");
+    setGuidedTuneSentence(null);
+    setCalibrationMsg("Guided voice tune: getting ready...");
     const startedByCalibration = !isListening;
     try {
       if (!isListening) {
         await startEngine(selectedDeviceName);
-        await new Promise((r) => window.setTimeout(r, 450));
+        await sleep(500);
       }
-      const ambient = await collectRmsSamples(2200);
-      setCalibrationMsg("Whisper phase: whisper naturally...");
-      await new Promise((r) => window.setTimeout(r, 250));
-      const whisper = await collectRmsSamples(2600);
-      setCalibrationMsg("Normal speech phase: speak at your usual volume...");
-      await new Promise((r) => window.setTimeout(r, 250));
-      const normal = await collectRmsSamples(2200);
+      const ambientSamples: number[] = [];
+      const whisperSamples: number[] = [];
+      const normalSamples: number[] = [];
+      let elapsedMs = 0;
 
-      const ambientP90 = percentile(ambient, 0.9);
-      const whisperP70 = percentile(whisper, 0.7);
-      const normalP80 = percentile(normal, 0.8);
-      const recommendedNoiseGate = clamp(ambientP90 * 1.45, 0.0004, 0.03);
-      const recommendedActivitySensitivity = clamp(
-        0.34 / Math.max(0.0001, whisperP70 - recommendedNoiseGate),
-        1.0,
-        20.0,
-      );
-      const recommendedPillSensitivity = clamp(recommendedActivitySensitivity * 1.12, 1.0, 20.0);
-      const recommendedInputGainBoost = clamp(0.02 / Math.max(0.0001, whisperP70), 0.5, 8.0);
-      const recommendedClipThreshold = clamp(
-        Math.max(normalP80 * 3.2, ambientP90 * 12, whisperP70 * 8),
-        0.12,
-        0.95,
-      );
+      for (const stage of GUIDED_TUNE_STAGES) {
+        if (stage.prepMs) {
+          setGuidedTuneStepLabel(stage.label);
+          setGuidedTuneInstruction(stage.instruction);
+          setGuidedTuneSentence(stage.sentence ?? null);
+          setCalibrationMsg(`${stage.label}: ${stage.instruction}`);
+          setGuidedTuneProgressPct(Math.round((elapsedMs / GUIDED_TUNE_TOTAL_MS) * 100));
+          await sleep(stage.prepMs);
+          elapsedMs += stage.prepMs;
+        }
 
-      setActivityNoiseGate(recommendedNoiseGate);
-      setActivitySensitivity(recommendedActivitySensitivity);
-      setActivityClipThreshold(recommendedClipThreshold);
-      setPillVisualizerSensitivity(recommendedPillSensitivity);
-      setInputGainBoost(recommendedInputGainBoost);
+        setGuidedTuneStepLabel(stage.label);
+        setGuidedTuneInstruction(stage.instruction);
+        setGuidedTuneSentence(stage.sentence ?? null);
+        setCalibrationMsg(
+          stage.sentence
+            ? `${stage.label}: say "${stage.sentence}"`
+            : `${stage.label}: ${stage.instruction}`,
+        );
+        setGuidedTuneProgressPct(Math.round((elapsedMs / GUIDED_TUNE_TOTAL_MS) * 100));
+        const stageSamples = await collectRmsSamples(stage.captureMs);
+        elapsedMs += stage.captureMs;
+
+        if (stage.mode === "ambient") ambientSamples.push(...stageSamples);
+        if (stage.mode === "whisper") whisperSamples.push(...stageSamples);
+        if (stage.mode === "normal") normalSamples.push(...stageSamples);
+
+        setGuidedTuneProgressPct(Math.round((elapsedMs / GUIDED_TUNE_TOTAL_MS) * 100));
+      }
+
+      setGuidedTuneStepLabel("Applying Tune");
+      setGuidedTuneInstruction("Analyzing your samples and updating dictation tuning.");
+      setGuidedTuneSentence(null);
+      setCalibrationMsg("Guided voice tune: analyzing samples...");
+
+      const ambientP90 = percentile(ambientSamples, 0.9);
+      const whisperP70 = percentile(whisperSamples, 0.7);
+      const normalP80 = percentile(normalSamples, 0.8);
+      const perf = await getPerfSnapshot();
+      const finalizeP95 = perf.finalizeMs?.p95Ms ?? 0;
+      const fallbackRate = perf.diagnostics.finalSegmentsSeen
+        ? (perf.diagnostics.fallbackStubTyped / perf.diagnostics.finalSegmentsSeen) * 100
+        : 0;
+
+      const tuned = await runBenchmarkAutoTune(
+        ambientP90,
+        whisperP70,
+        normalP80,
+        finalizeP95,
+        fallbackRate,
+      );
+      const runtime = tuned.runtimeSettings;
+      setModelProfile(runtime.modelProfile || "distil-large-v3");
+      setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
+      setDictationMode((runtime.dictationMode || "conversation") as DictationMode);
+      setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
+      setOrtEp(runtime.ortEp || "auto");
+      setOrtIntraThreads(runtime.ortIntraThreads ?? 0);
+      setOrtInterThreads(runtime.ortInterThreads ?? 0);
+      setOrtParallel(runtime.ortParallel ?? true);
+      setLanguageHint(runtime.languageHint || "english");
+      setPillVisualizerSensitivity(runtime.pillVisualizerSensitivity || 10);
+      setActivitySensitivity(runtime.activitySensitivity || 4.2);
+      setActivityNoiseGate(runtime.activityNoiseGate ?? 0.0015);
+      setActivityClipThreshold(runtime.activityClipThreshold ?? 0.32);
+      setInputGainBoost(runtime.inputGainBoost || 1);
+      setPostUtteranceRefine(runtime.postUtteranceRefine ?? false);
+      setPhraseBiasTerms((runtime.phraseBiasTerms || []).join("\n"));
+      setCloudMode((runtime.cloudMode || "local_only") as CloudMode);
+      setCloudOptIn(runtime.cloudOptIn);
+      setReliabilityMode(runtime.reliabilityMode ?? true);
 
       if (selectedDeviceName) {
-        try {
-          const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
-          const all = (raw ? JSON.parse(raw) : {}) as Record<string, MicCalibration>;
-          all[selectedDeviceName] = {
-            pillVisualizerSensitivity: recommendedPillSensitivity,
-            activitySensitivity: recommendedActivitySensitivity,
-            activityNoiseGate: recommendedNoiseGate,
-            activityClipThreshold: recommendedClipThreshold,
-            inputGainBoost: recommendedInputGainBoost,
-          };
-          localStorage.setItem(MIC_CALIBRATION_STORAGE_KEY, JSON.stringify(all));
-        } catch {
-          // Ignore local storage errors.
-        }
+        saveCalibrationProfile(selectedDeviceName, {
+          pillVisualizerSensitivity: runtime.pillVisualizerSensitivity || 10,
+          activitySensitivity: runtime.activitySensitivity || 4.2,
+          activityNoiseGate: runtime.activityNoiseGate ?? 0.0015,
+          activityClipThreshold: runtime.activityClipThreshold ?? 0.32,
+          inputGainBoost: runtime.inputGainBoost || 1,
+          guidedTuneVersion: GUIDED_TUNE_VERSION,
+          calibratedAt: new Date().toISOString(),
+        });
       }
 
-      await applyRuntime({
-        pillVisualizerSensitivity: recommendedPillSensitivity,
-        activitySensitivity: recommendedActivitySensitivity,
-        activityNoiseGate: recommendedNoiseGate,
-        activityClipThreshold: recommendedClipThreshold,
-        inputGainBoost: recommendedInputGainBoost,
-      });
-      const envLabel = ambientP90 > 0.01 ? "noisy" : "stable";
+      setGuidedTuneCompletedForDevice(true);
+      setGuidedTuneProgressPct(100);
+      const envLabel = ambientP90 > 0.01 ? "noisy room" : "steady room";
       setCalibrationMsg(
-        `Diagnostics complete (${envLabel} room). Sensitivity + gain tuned for whispers and normal speech.`,
+        `Guided voice tune complete for ${envLabel}. Whisper and normal speech thresholds were updated in about 30 seconds.`,
       );
+      setRuntimeMsg(tuned.summary);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setCalibrationMsg(`Calibration failed: ${msg}`);
+      setCalibrationMsg(`Guided voice tune failed: ${msg}`);
     } finally {
       if (startedByCalibration) {
         await stopEngine().catch(() => undefined);
       }
+      setGuidedTuneStepLabel(null);
+      setGuidedTuneInstruction(null);
+      setGuidedTuneSentence(null);
       setIsCalibrating(false);
     }
   }, [
@@ -1272,8 +1657,11 @@ export default function Home() {
     selectedDeviceName,
     startEngine,
     collectRmsSamples,
-    applyRuntime,
+    getPerfSnapshot,
+    runBenchmarkAutoTune,
+    sleep,
     stopEngine,
+    selectedDeviceName,
   ]);
 
   const runBenchmarkTune = useCallback(async () => {
@@ -1316,6 +1704,7 @@ export default function Home() {
       const runtime = tuned.runtimeSettings;
       setModelProfile(runtime.modelProfile || "distil-large-v3");
       setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
+      setDictationMode((runtime.dictationMode || "conversation") as DictationMode);
       setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
       setOrtEp(runtime.ortEp || "auto");
       setOrtIntraThreads(runtime.ortIntraThreads ?? 0);
@@ -1655,7 +2044,9 @@ export default function Home() {
                 ))}
                 {correctionSuggestions.length > 0 && (
                   <div className="suggestion-strip">
-                    <span className="suggestion-label">Likely corrections</span>
+                    <span className="suggestion-label">
+                      Likely corrections · {effectiveSuggestionMode}
+                    </span>
                     {correctionSuggestions.map((s) => (
                       <button
                         key={s.id}
@@ -2066,10 +2457,10 @@ export default function Home() {
                     Auto Tune
                   </button>
                   <button className="action-btn" onClick={() => void runBenchmarkTune()} disabled={isBenchmarkTuning}>
-                    {isBenchmarkTuning ? "Benchmarking..." : "Benchmark Tune"}
+                    {isBenchmarkTuning ? "Benchmarking..." : "Advanced Benchmark Tune"}
                   </button>
                   <button className="action-btn" onClick={() => void runMicCalibration()} disabled={isCalibrating}>
-                    {isCalibrating ? "Running..." : "Diagnostics Wizard"}
+                    {isCalibrating ? "Guided Tune Running..." : "Guided Voice Tune"}
                   </button>
                   <button className="action-btn settings-save-btn" onClick={() => void applyRuntime()}>
                     Save Settings
@@ -2211,6 +2602,20 @@ export default function Home() {
                       </select>
                     </label>
                     <label className="settings-field">
+                      <span>Dictation Mode</span>
+                      <select
+                        className="settings-input"
+                        value={dictationMode}
+                        onChange={(e) => setDictationMode(e.target.value as DictationMode)}
+                      >
+                        {DICTATION_MODE_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="settings-field">
                       <span>Language</span>
                       <select
                         className="settings-input"
@@ -2326,6 +2731,9 @@ export default function Home() {
                     <h3>Recognition</h3>
                     <p>Bias and post-processing behavior for final transcript quality.</p>
                   </div>
+                  <p className="settings-note">
+                    {DICTATION_MODE_OPTIONS.find((opt) => opt.value === dictationMode)?.hint}
+                  </p>
                   <label className="settings-field">
                     <span>Phrase Bias Terms</span>
                     <textarea
@@ -2344,6 +2752,132 @@ export default function Home() {
                     <input type="checkbox" checked={reliabilityMode} onChange={(e) => setReliabilityMode(e.target.checked)} />
                     <span>Whisper reliability mode (re-try low-confidence finals)</span>
                   </label>
+                </article>
+
+                <article className="settings-card">
+                  <div className="settings-card-header">
+                    <h3>Per-App Profiles</h3>
+                    <p>Automatically switch dictation mode when the foreground app matches an executable name.</p>
+                  </div>
+                  <div className="settings-inline-stats">
+                    <span>Foreground {activeAppContext?.foregroundApp || "unknown"}</span>
+                    <span>
+                      Active profile {activeAppContext?.matchedProfileName || "global default"}
+                    </span>
+                    <span>Mode {activeAppContext?.dictationMode || dictationMode}</span>
+                    <span>
+                      Bias terms {activeAppContext?.phraseBiasTermCount ?? phraseBiasTerms.split(/\r?\n|,/).filter(Boolean).length}
+                    </span>
+                  </div>
+                  <div className="settings-fields">
+                    <label className="settings-field">
+                      <span>Profile Name</span>
+                      <input
+                        className="settings-input"
+                        value={appProfileName}
+                        onChange={(e) => setAppProfileName(e.target.value)}
+                        placeholder="Cursor Coding"
+                      />
+                    </label>
+                    <label className="settings-field">
+                      <span>App Match</span>
+                      <input
+                        className="settings-input"
+                        value={appProfileMatch}
+                        onChange={(e) => setAppProfileMatch(e.target.value)}
+                        placeholder="cursor.exe"
+                      />
+                    </label>
+                    <label className="settings-field">
+                      <span>Mode Override</span>
+                      <select
+                        className="settings-input"
+                        value={appProfileMode}
+                        onChange={(e) => setAppProfileMode(e.target.value as DictationMode)}
+                      >
+                        {DICTATION_MODE_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Bias Terms</span>
+                      <textarea
+                        className="settings-input settings-textarea"
+                        value={appProfileBiasTerms}
+                        onChange={(e) => setAppProfileBiasTerms(e.target.value)}
+                        placeholder={"One term per line.\nTypeScript\nPostgreSQL"}
+                        rows={4}
+                      />
+                    </label>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      checked={appProfileRefine}
+                      onChange={(e) => setAppProfileRefine(e.target.checked)}
+                    />
+                    <span>Enable post-utterance refinement for this app profile</span>
+                  </label>
+                  <div className="settings-inline-actions">
+                    <button className="action-btn" onClick={() => void handleSaveAppProfile()}>
+                      Save App Profile
+                    </button>
+                    <button className="action-btn" onClick={() => void handleCopyAppProfiles()}>
+                      {appProfilesCopied === "done"
+                        ? "Copied"
+                        : appProfilesCopied === "error"
+                          ? "Copy Failed"
+                          : "Copy JSON"}
+                    </button>
+                    <span className="settings-note">
+                      Matches use lowercase executable names like `cursor.exe`, `code.exe`, or `WindowsTerminal.exe`.
+                    </span>
+                  </div>
+                  <label className="settings-field">
+                    <span>Import Profiles JSON</span>
+                    <textarea
+                      className="settings-input settings-textarea"
+                      value={appProfilesImportText}
+                      onChange={(e) => setAppProfilesImportText(e.target.value)}
+                      placeholder='[{"name":"Cursor Coding","appMatch":"cursor.exe","dictationMode":"coding","phraseBiasTerms":["TypeScript"],"postUtteranceRefine":true,"enabled":true}]'
+                      rows={4}
+                    />
+                  </label>
+                  <div className="settings-inline-actions">
+                    <button className="action-btn" onClick={() => void handleImportAppProfiles()}>
+                      Import Profiles
+                    </button>
+                  </div>
+                  <div className="panel-list">
+                    {appProfiles.length === 0 ? (
+                      <p className="settings-note">No app-specific profiles yet.</p>
+                    ) : (
+                      appProfiles.map((profile) => (
+                        <article key={profile.id} className="panel-card">
+                          <div className="panel-meta">
+                            <span>{profile.name}</span>
+                            <span>{profile.appMatch}</span>
+                            <span>{profile.dictationMode}</span>
+                            {profile.postUtteranceRefine && <span>refine</span>}
+                          </div>
+                          {profile.phraseBiasTerms.length > 0 && (
+                            <p>{profile.phraseBiasTerms.join(", ")}</p>
+                          )}
+                          <div className="context-menu">
+                            <button
+                              className="context-action danger"
+                              onClick={() => void handleDeleteAppProfile(profile.id, profile.name)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </article>
+                      ))
+                    )}
+                  </div>
                 </article>
 
                 <article className="settings-card">
@@ -2375,10 +2909,41 @@ export default function Home() {
                     <button className="action-btn" onClick={() => void handleLearnCorrection()}>
                       Learn Correction
                     </button>
+                    <button className="action-btn" onClick={() => void handleCopyCorrections()}>
+                      {correctionsCopied === "done"
+                        ? "Copied"
+                        : correctionsCopied === "error"
+                          ? "Copy Failed"
+                          : "Copy JSON"}
+                    </button>
                     <span className="settings-note">{learnedCorrections.length} learned rules</span>
                   </div>
+                  <label className="settings-field">
+                    <span>Filter Rules</span>
+                    <input
+                      className="settings-input"
+                      value={correctionFilter}
+                      onChange={(e) => setCorrectionFilter(e.target.value)}
+                      placeholder="Search heard or corrected text"
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Import Corrections JSON</span>
+                    <textarea
+                      className="settings-input settings-textarea"
+                      value={correctionsImportText}
+                      onChange={(e) => setCorrectionsImportText(e.target.value)}
+                      placeholder='[{"heard":"ladder labs","corrected":"Lattice Labs","hits":1}]'
+                      rows={4}
+                    />
+                  </label>
+                  <div className="settings-inline-actions">
+                    <button className="action-btn" onClick={() => void handleImportCorrections()}>
+                      Import Corrections
+                    </button>
+                  </div>
                   <div className="panel-list">
-                    {learnedCorrections.slice(0, 8).map((rule) => (
+                    {filteredLearnedCorrections.slice(0, 12).map((rule) => (
                       <article key={`${rule.heard}:${rule.corrected}`} className="panel-card">
                         <div className="panel-meta">
                           <span>{rule.heard}</span>
@@ -2394,8 +2959,12 @@ export default function Home() {
                         </button>
                       </article>
                     ))}
-                    {learnedCorrections.length === 0 && (
-                      <p className="settings-note">No learned corrections yet.</p>
+                    {filteredLearnedCorrections.length === 0 && (
+                      <p className="settings-note">
+                        {learnedCorrections.length === 0
+                          ? "No learned corrections yet."
+                          : "No learned corrections match the current filter."}
+                      </p>
                     )}
                   </div>
                 </article>
@@ -2449,11 +3018,34 @@ export default function Home() {
                     <input type="checkbox" checked={historyEnabled} onChange={(e) => setHistoryEnabled(e.target.checked)} />
                     <span>Save local history</span>
                   </label>
+                  <div className="guided-tune-card">
+                    <div className="guided-tune-head">
+                      <div>
+                        <span className="settings-kicker">0.1.8 Tune</span>
+                        <h3>Guided Voice Tune</h3>
+                      </div>
+                      <span className={`guided-tune-badge ${guidedTuneCompletedForDevice ? "is-ready" : ""}`}>
+                        {guidedTuneCompletedForDevice ? "Ready" : "Needs run"}
+                      </span>
+                    </div>
+                    <p className="settings-note">
+                      A scripted 30-second calibration that listens to room tone, normal speech, and whisper speech.
+                    </p>
+                    <div className="guided-tune-progress" aria-hidden="true">
+                      <div style={{ width: `${guidedTuneProgressPct}%` }} />
+                    </div>
+                    <div className="guided-tune-copy">
+                      <strong>{guidedTuneStepLabel ?? "Ready to calibrate"}</strong>
+                      <span>{guidedTuneInstruction ?? "Press Guided Voice Tune to start the scripted calibration."}</span>
+                      {guidedTuneSentence && <em>"{guidedTuneSentence}"</em>}
+                    </div>
+                  </div>
                   <p className="settings-note">
                     {runtimeMsg ?? "Cloud fallback requires an OpenAI API key."}
                   </p>
                   <p className="settings-note">
-                    {calibrationMsg ?? "Run mic calibration after changing devices or recording environment."}
+                    {calibrationMsg ??
+                      "Run the guided voice tune after changing microphones or recording environments."}
                   </p>
                 </article>
 
@@ -2583,7 +3175,7 @@ export default function Home() {
           <section className="onboarding-modal">
             <span className="settings-kicker">First Launch</span>
             <h2>Welcome to Dictum</h2>
-            <p>Set your keybind, transcription defaults, and cloud preference before starting.</p>
+            <p>Set your keybind, transcription defaults, and run the guided 30-second voice tune before starting.</p>
 
             <div className="settings-fields">
               <label className="settings-field">
@@ -2624,6 +3216,20 @@ export default function Home() {
                 </select>
               </label>
               <label className="settings-field">
+                <span>Dictation Mode</span>
+                <select
+                  className="settings-input"
+                  value={dictationMode}
+                  onChange={(e) => setDictationMode(e.target.value as DictationMode)}
+                >
+                  {DICTATION_MODE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
                 <span>Cloud Mode</span>
                 <select className="settings-input" value={cloudMode} onChange={(e) => setCloudMode(e.target.value as CloudMode)}>
                   {CLOUD_MODE_OPTIONS.map((opt) => (
@@ -2652,14 +3258,49 @@ export default function Home() {
               <span>Enable reliability mode (recommended)</span>
             </label>
 
+            <p className="settings-note">
+              {DICTATION_MODE_OPTIONS.find((opt) => opt.value === dictationMode)?.hint}
+            </p>
+
+            <div className="guided-tune-card onboarding-guided-tune">
+              <div className="guided-tune-head">
+                <div>
+                  <span className="settings-kicker">Required Step</span>
+                  <h3>Guided Voice Tune</h3>
+                </div>
+                <span className={`guided-tune-badge ${guidedTuneCompletedForDevice ? "is-ready" : ""}`}>
+                  {guidedTuneCompletedForDevice ? "Complete" : "Pending"}
+                </span>
+              </div>
+              <p className="settings-note">
+                Read two short sentences at normal volume and two in a whisper. Dictum uses that sample to tune gain,
+                speech sensitivity, and latency defaults for this microphone.
+              </p>
+              <div className="guided-tune-progress" aria-hidden="true">
+                <div style={{ width: `${guidedTuneProgressPct}%` }} />
+              </div>
+              <div className="guided-tune-copy">
+                <strong>{guidedTuneStepLabel ?? "About 30 seconds"}</strong>
+                <span>
+                  {guidedTuneInstruction ??
+                    "This is required for first-run setup so whisper and normal speech both behave correctly."}
+                </span>
+                {guidedTuneSentence && <em>"{guidedTuneSentence}"</em>}
+              </div>
+            </div>
+
             <div className="settings-inline-actions">
               <button className="action-btn" onClick={() => void runMicCalibration()} disabled={isCalibrating}>
-                {isCalibrating ? "Running diagnostics..." : "Run mic diagnostics"}
+                {isCalibrating ? "Running guided tune..." : "Run Guided Voice Tune"}
               </button>
               <button className="action-btn" onClick={() => void runBenchmarkTune()} disabled={isBenchmarkTuning}>
-                {isBenchmarkTuning ? "Benchmarking..." : "Run benchmark tune"}
+                {isBenchmarkTuning ? "Benchmarking..." : "Advanced Benchmark Tune"}
               </button>
-              <button className="action-btn settings-save-btn" onClick={() => void completeOnboarding()}>
+              <button
+                className="action-btn settings-save-btn"
+                onClick={() => void completeOnboarding()}
+                disabled={!guidedTuneCompletedForDevice || isCalibrating}
+              >
                 Finish Setup
               </button>
               {onboardingCompleted && (
@@ -2670,7 +3311,9 @@ export default function Home() {
             </div>
 
             <p className="settings-note">
-              {runtimeMsg ?? "You can re-open this onboarding anytime from Settings."}
+              {guidedTuneCompletedForDevice
+                ? runtimeMsg ?? "You can re-open onboarding anytime from Settings."
+                : calibrationMsg ?? "Run the guided voice tune to unlock Finish Setup."}
             </p>
           </section>
         </div>

@@ -27,6 +27,8 @@ import type {
   AutoTuneResult,
   BenchmarkAutoTuneResult,
   AppUpdateInfo,
+  AppProfile,
+  ActiveAppContext,
   LearnedCorrection,
 } from "@shared/ipc_types";
 
@@ -113,6 +115,7 @@ export const downloadAndInstallAppUpdate = (
 export const setRuntimeSettings = (
   modelProfile?: string | null,
   performanceProfile?: string | null,
+  dictationMode?: string | null,
   toggleShortcut?: string | null,
   ortEp?: string | null,
   ortIntraThreads?: number | null,
@@ -137,6 +140,7 @@ export const setRuntimeSettings = (
   tauriInvoke("set_runtime_settings", {
     modelProfile: modelProfile ?? null,
     performanceProfile: performanceProfile ?? null,
+    dictationMode: dictationMode ?? null,
     toggleShortcut: toggleShortcut ?? null,
     ortEp: ortEp ?? null,
     ortIntraThreads: ortIntraThreads ?? null,
@@ -244,6 +248,18 @@ export const deleteLearnedCorrection = (
     heard,
     corrected: corrected ?? null,
   });
+
+export const getAppProfiles = (): Promise<AppProfile[]> =>
+  tauriInvoke("get_app_profiles");
+
+export const upsertAppProfile = (profile: AppProfile): Promise<AppProfile[]> =>
+  tauriInvoke("upsert_app_profile", { profile });
+
+export const deleteAppProfile = (id: string): Promise<AppProfile[]> =>
+  tauriInvoke("delete_app_profile", { id });
+
+export const getActiveAppContext = (): Promise<ActiveAppContext> =>
+  tauriInvoke("get_active_app_context");
 
 // ---------------------------------------------------------------------------
 // Event listeners

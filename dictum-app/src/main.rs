@@ -32,8 +32,8 @@ use dictum_core::{
 };
 use parking_lot::Mutex;
 use settings::{
-    apply_runtime_env_from_settings, default_settings_path, engine_config_for_settings,
-    load_settings, RuntimeEnvMode,
+    apply_runtime_env_from_settings, apply_runtime_env_with_profile, default_settings_path,
+    engine_config_for_settings, load_settings, resolve_app_profile, RuntimeEnvMode,
 };
 use state::{AppState, PerfMetrics};
 use storage::{HistoryRecordInput, LocalStore};
@@ -44,7 +44,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::ShortcutState;
 use tracing::info;
-use transform::TextTransform;
+use transform::{DictationMode, TextTransform};
 
 const DEFAULT_GLOBAL_TOGGLE_SHORTCUT: &str = "Ctrl+Shift+Space";
 const TRAY_SHOW_HIDE_ID: &str = "tray_show_hide";
@@ -166,6 +166,16 @@ fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             reveal_main_window(app);
         }
     }
+}
+
+fn resolve_dictation_mode_for_app(
+    settings: &settings::AppSettings,
+    foreground_app: Option<&str>,
+) -> DictationMode {
+    if let Some(profile) = resolve_app_profile(settings, foreground_app) {
+        return DictationMode::from_str(&profile.dictation_mode);
+    }
+    DictationMode::from_str(&settings.dictation_mode)
 }
 
 fn setup_system_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
@@ -502,6 +512,14 @@ fn main() {
                             let mut dictionary_applied = false;
                             let mut snippet_applied = false;
                             let corrections_snapshot = learned_corrections_clone.read().clone();
+                            let active_app = text_injector::foreground_process_name();
+                            let dictation_mode = {
+                                let settings_guard = settings_clone.lock();
+                                resolve_dictation_mode_for_app(
+                                    &settings_guard,
+                                    active_app.as_deref(),
+                                )
+                            };
                             let transform_started = Instant::now();
                             for segment in event
                                 .segments
@@ -512,7 +530,8 @@ fn main() {
                                     segment.text.trim(),
                                     &corrections_snapshot,
                                 );
-                                let transformed = transformer_clone.apply(corrected_text.trim());
+                                let transformed =
+                                    transformer_clone.apply(corrected_text.trim(), dictation_mode);
                                 if !transformed.text.is_empty() {
                                     segment.text = transformed.text.clone();
                                     final_text_parts.push(transformed.text);
@@ -701,6 +720,47 @@ fn main() {
                 }
             });
 
+            let settings_for_profile_watcher = Arc::clone(&settings_for_setup);
+            tauri::async_runtime::spawn(async move {
+                let mut last_profile_key = String::new();
+                loop {
+                    let active_app = text_injector::foreground_process_name();
+                    let profile_key = {
+                        let settings_guard = settings_for_profile_watcher.lock();
+                        let matched_profile =
+                            resolve_app_profile(&settings_guard, active_app.as_deref());
+                        let profile_key = matched_profile
+                            .map(|profile| {
+                                format!(
+                                    "{}|{}|{}|{}",
+                                    profile.id,
+                                    profile.dictation_mode,
+                                    profile.post_utterance_refine,
+                                    profile.phrase_bias_terms.join("\n")
+                                )
+                            })
+                            .unwrap_or_else(|| "base".to_string());
+                        if profile_key != last_profile_key {
+                            apply_runtime_env_with_profile(
+                                &settings_guard,
+                                matched_profile,
+                                RuntimeEnvMode::Overwrite,
+                            );
+                            tracing::debug!(
+                                active_app = active_app.as_deref().unwrap_or(""),
+                                profile = profile_key,
+                                "applied runtime env for active app profile"
+                            );
+                        }
+                        profile_key
+                    };
+                    if profile_key != last_profile_key {
+                        last_profile_key = profile_key;
+                    }
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                }
+            });
+
             ensure_pill_window(&app_handle)?;
 
             Ok(())
@@ -742,6 +802,10 @@ fn main() {
             commands::get_learned_corrections,
             commands::learn_correction,
             commands::delete_learned_correction,
+            commands::get_app_profiles,
+            commands::upsert_app_profile,
+            commands::delete_app_profile,
+            commands::get_active_app_context,
             commands::get_perf_snapshot,
             commands::get_diagnostics_bundle,
             commands::get_privacy_settings,

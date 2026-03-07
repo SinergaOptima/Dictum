@@ -1421,6 +1421,97 @@ body {
   flex-wrap: wrap;
 }
 
+.guided-tune-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid rgba(var(--border), 0.72);
+  border-radius: 12px;
+  padding: 11px 12px;
+  background:
+    radial-gradient(120% 120% at 100% 0%, rgba(var(--accent), 0.12), transparent 62%),
+    rgba(var(--bg), 0.44);
+}
+
+.guided-tune-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.guided-tune-head h3 {
+  margin: 4px 0 0;
+  font-size: 0.82rem;
+  color: rgba(var(--fg), 0.98);
+  font-family: var(--font-body), sans-serif;
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+.guided-tune-badge {
+  border: 1px solid rgba(var(--border), 0.8);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(var(--bg), 0.56);
+  color: rgba(var(--muted), 0.94);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-family: var(--font-mono), monospace;
+  white-space: nowrap;
+}
+
+.guided-tune-badge.is-ready {
+  border-color: rgba(var(--good), 0.46);
+  color: rgb(var(--good));
+  background: rgba(var(--good), 0.08);
+}
+
+.guided-tune-progress {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(var(--border), 0.78);
+  background: rgba(var(--bg), 0.82);
+}
+
+.guided-tune-progress > div {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(var(--accent), 0.88), rgba(var(--accent-glow), 0.98));
+  transition: width 160ms ease;
+}
+
+.guided-tune-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.guided-tune-copy strong {
+  font-size: 0.76rem;
+  color: rgba(var(--fg), 0.98);
+}
+
+.guided-tune-copy span,
+.guided-tune-copy em {
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: rgba(var(--muted), 0.9);
+}
+
+.guided-tune-copy em {
+  color: rgba(var(--fg), 0.94);
+  font-style: normal;
+}
+
+.onboarding-guided-tune {
+  margin-top: 2px;
+}
+
 .onboarding-backdrop {
   position: fixed;
   inset: 0;

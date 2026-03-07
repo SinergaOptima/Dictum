@@ -16,14 +16,16 @@ use crate::model_profiles::{
 };
 use crate::settings::{
     normalize_cloud_mode, normalize_language_hint, normalize_model_profile, normalize_ort_ep,
-    normalize_performance_profile, normalize_toggle_shortcut, save_settings,
-    sync_runtime_with_settings, LearnedCorrection, RuntimeEnvMode, RuntimeSettings,
+    normalize_dictation_mode, normalize_performance_profile, normalize_toggle_shortcut,
+    resolve_app_profile, save_settings, sync_runtime_with_settings, AppProfile,
+    LearnedCorrection, RuntimeEnvMode, RuntimeSettings,
 };
 use crate::state::{AppState, PerfSnapshot};
 use crate::storage::{
     DictionaryEntry, HistoryPage, HistoryStorageSummary, PrivacySettings, SnippetEntry,
     StatsPayload,
 };
+use crate::text_injector;
 
 const DEFAULT_UPDATE_REPO_SLUG: &str = "sinergaoptima/dictum";
 const LEGACY_UPDATE_REPO_SLUGS: &[&str] = &["latticelabs/dictum"];
@@ -79,6 +81,17 @@ pub struct DiagnosticsBundle {
     pub perf_snapshot: PerfSnapshot,
     pub history_storage: HistoryStorageSummary,
     pub devices: Vec<DeviceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAppContext {
+    pub foreground_app: Option<String>,
+    pub matched_profile_id: Option<String>,
+    pub matched_profile_name: Option<String>,
+    pub dictation_mode: String,
+    pub phrase_bias_term_count: usize,
+    pub post_utterance_refine: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -820,6 +833,63 @@ pub async fn delete_learned_correction(
     Ok(updated)
 }
 
+/// Return configured per-app dictation profiles.
+#[tauri::command]
+pub async fn get_app_profiles(state: State<'_, AppState>) -> Result<Vec<AppProfile>, String> {
+    Ok(state.settings.lock().app_profiles.clone())
+}
+
+/// Upsert a per-app dictation profile.
+#[tauri::command]
+pub async fn upsert_app_profile(
+    state: State<'_, AppState>,
+    profile: AppProfile,
+) -> Result<Vec<AppProfile>, String> {
+    let mut settings = state.settings.lock();
+    if let Some(existing) = settings.app_profiles.iter_mut().find(|p| p.id == profile.id) {
+        *existing = profile;
+    } else {
+        settings.app_profiles.push(profile);
+    }
+    settings.normalize();
+    save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
+    Ok(settings.app_profiles.clone())
+}
+
+/// Delete a per-app dictation profile by id.
+#[tauri::command]
+pub async fn delete_app_profile(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<AppProfile>, String> {
+    let mut settings = state.settings.lock();
+    settings.app_profiles.retain(|profile| profile.id != id);
+    save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
+    Ok(settings.app_profiles.clone())
+}
+
+/// Return the current foreground app and any matched app profile override.
+#[tauri::command]
+pub async fn get_active_app_context(state: State<'_, AppState>) -> Result<ActiveAppContext, String> {
+    let foreground_app = text_injector::foreground_process_name();
+    let settings = state.settings.lock();
+    let matched_profile = resolve_app_profile(&settings, foreground_app.as_deref());
+    Ok(ActiveAppContext {
+        foreground_app,
+        matched_profile_id: matched_profile.map(|profile| profile.id.clone()),
+        matched_profile_name: matched_profile.map(|profile| profile.name.clone()),
+        dictation_mode: matched_profile
+            .map(|profile| profile.dictation_mode.clone())
+            .unwrap_or_else(|| settings.dictation_mode.clone()),
+        phrase_bias_term_count: matched_profile
+            .map(|profile| profile.phrase_bias_terms.len())
+            .unwrap_or_else(|| settings.phrase_bias_terms.len()),
+        post_utterance_refine: matched_profile
+            .map(|profile| profile.post_utterance_refine)
+            .unwrap_or(settings.post_utterance_refine),
+    })
+}
+
 /// Persist runtime settings.
 ///
 /// These settings are applied immediately for env-backed toggles and on next app
@@ -830,6 +900,7 @@ pub async fn set_runtime_settings(
     state: State<'_, AppState>,
     model_profile: Option<String>,
     performance_profile: Option<String>,
+    dictation_mode: Option<String>,
     toggle_shortcut: Option<String>,
     ort_ep: Option<String>,
     ort_intra_threads: Option<usize>,
@@ -859,6 +930,9 @@ pub async fn set_runtime_settings(
     }
     if let Some(profile) = performance_profile {
         settings.performance_profile = normalize_performance_profile(&profile);
+    }
+    if let Some(mode) = dictation_mode {
+        settings.dictation_mode = normalize_dictation_mode(&mode);
     }
     if let Some(shortcut) = toggle_shortcut {
         settings.toggle_shortcut = normalize_toggle_shortcut(&shortcut);

@@ -131,6 +131,8 @@ export interface RuntimeSettings {
     | "stability_long_form"
     | "balanced_general"
     | "latency_short_utterance";
+  /** Post-processing mode for final dictated text. */
+  dictationMode: "conversation" | "coding" | "command";
   /** Global push-to-talk toggle shortcut. */
   toggleShortcut: string;
   /** ONNX execution provider preference: "auto" | "cpu" | "directml". */
@@ -173,6 +175,27 @@ export interface RuntimeSettings {
   retentionDays: number;
   /** Number of learned correction rules. */
   correctionCount: number;
+  /** Number of configured per-app profiles. */
+  appProfileCount: number;
+}
+
+export interface AppProfile {
+  id: string;
+  name: string;
+  appMatch: string;
+  dictationMode: "conversation" | "coding" | "command";
+  phraseBiasTerms: string[];
+  postUtteranceRefine: boolean;
+  enabled: boolean;
+}
+
+export interface ActiveAppContext {
+  foregroundApp: string | null;
+  matchedProfileId: string | null;
+  matchedProfileName: string | null;
+  dictationMode: "conversation" | "coding" | "command" | string;
+  phraseBiasTermCount: number;
+  postUtteranceRefine: boolean;
 }
 
 // ---------------------------------------------------------------------------

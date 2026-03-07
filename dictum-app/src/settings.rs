@@ -16,11 +16,24 @@ pub struct LearnedCorrection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppProfile {
+    pub id: String,
+    pub name: String,
+    pub app_match: String,
+    pub dictation_mode: String,
+    pub phrase_bias_terms: Vec<String>,
+    pub post_utterance_refine: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct AppSettings {
     pub preferred_input_device: Option<String>,
     pub model_profile: String,
     pub performance_profile: String,
+    pub dictation_mode: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
     pub ort_intra_threads: usize,
@@ -42,6 +55,7 @@ pub struct AppSettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub learned_corrections: Vec<LearnedCorrection>,
+    pub app_profiles: Vec<AppProfile>,
 }
 
 impl Default for AppSettings {
@@ -50,6 +64,7 @@ impl Default for AppSettings {
             preferred_input_device: None,
             model_profile: "distil-large-v3".into(),
             performance_profile: "whisper_balanced_english".into(),
+            dictation_mode: "conversation".into(),
             toggle_shortcut: "Ctrl+Shift+Space".into(),
             ort_ep: "auto".into(),
             ort_intra_threads: 0,
@@ -71,6 +86,7 @@ impl Default for AppSettings {
             history_enabled: true,
             retention_days: 90,
             learned_corrections: Vec::new(),
+            app_profiles: Vec::new(),
         }
     }
 }
@@ -80,6 +96,7 @@ impl Default for AppSettings {
 pub struct RuntimeSettings {
     pub model_profile: String,
     pub performance_profile: String,
+    pub dictation_mode: String,
     pub toggle_shortcut: String,
     pub ort_ep: String,
     pub ort_intra_threads: usize,
@@ -101,6 +118,7 @@ pub struct RuntimeSettings {
     pub history_enabled: bool,
     pub retention_days: usize,
     pub correction_count: usize,
+    pub app_profile_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -113,6 +131,7 @@ impl AppSettings {
     pub fn normalize(&mut self) {
         self.model_profile = normalize_model_profile(&self.model_profile);
         self.performance_profile = normalize_performance_profile(&self.performance_profile);
+        self.dictation_mode = normalize_dictation_mode(&self.dictation_mode);
         self.toggle_shortcut = normalize_toggle_shortcut(&self.toggle_shortcut);
         self.ort_ep = normalize_ort_ep(&self.ort_ep);
         self.ort_intra_threads = self.ort_intra_threads.clamp(0, 32);
@@ -147,6 +166,7 @@ impl AppSettings {
         }
         self.retention_days = self.retention_days.clamp(1, 3650);
         self.learned_corrections = normalize_learned_corrections(&self.learned_corrections);
+        self.app_profiles = normalize_app_profiles(&self.app_profiles);
         self.preferred_input_device = self
             .preferred_input_device
             .as_ref()
@@ -158,6 +178,7 @@ impl AppSettings {
         RuntimeSettings {
             model_profile: self.model_profile.clone(),
             performance_profile: self.performance_profile.clone(),
+            dictation_mode: self.dictation_mode.clone(),
             toggle_shortcut: self.toggle_shortcut.clone(),
             ort_ep: self.ort_ep.clone(),
             ort_intra_threads: self.ort_intra_threads,
@@ -179,6 +200,7 @@ impl AppSettings {
             history_enabled: self.history_enabled,
             retention_days: self.retention_days,
             correction_count: self.learned_corrections.len(),
+            app_profile_count: self.app_profiles.len(),
         }
     }
 }
@@ -254,6 +276,78 @@ pub fn normalize_performance_profile(raw: &str) -> String {
             "latency_short_utterance".into()
         }
         _ => "whisper_balanced_english".into(),
+    }
+}
+
+pub fn normalize_dictation_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "coding" | "code" => "coding".into(),
+        "command" | "commands" => "command".into(),
+        _ => "conversation".into(),
+    }
+}
+
+fn normalize_app_profiles(profiles: &[AppProfile]) -> Vec<AppProfile> {
+    let mut out = Vec::new();
+    for profile in profiles {
+        let id = profile.id.trim().to_string();
+        let name = profile.name.trim().to_string();
+        let app_match = profile.app_match.trim().to_ascii_lowercase();
+        if id.is_empty() || name.is_empty() || app_match.is_empty() {
+            continue;
+        }
+        out.push(AppProfile {
+            id,
+            name,
+            app_match,
+            dictation_mode: normalize_dictation_mode(&profile.dictation_mode),
+            phrase_bias_terms: normalize_phrase_bias_terms(&profile.phrase_bias_terms),
+            post_utterance_refine: profile.post_utterance_refine,
+            enabled: profile.enabled,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.app_match.cmp(&b.app_match)));
+    out
+}
+
+pub fn resolve_app_profile<'a>(
+    settings: &'a AppSettings,
+    foreground_app: Option<&str>,
+) -> Option<&'a AppProfile> {
+    let app = foreground_app.unwrap_or_default();
+    if app.is_empty() {
+        return None;
+    }
+    settings
+        .app_profiles
+        .iter()
+        .find(|profile| profile.enabled && app.contains(profile.app_match.as_str()))
+}
+
+pub fn apply_runtime_env_with_profile(
+    settings: &AppSettings,
+    profile: Option<&AppProfile>,
+    mode: RuntimeEnvMode,
+) {
+    apply_runtime_env_from_settings(settings, mode);
+    if let Some(profile) = profile {
+        set_runtime_var(
+            "DICTUM_POST_UTTERANCE_REFINEMENT",
+            Some(
+                if profile.post_utterance_refine {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            ),
+            RuntimeEnvMode::Overwrite,
+        );
+        set_runtime_var(
+            "DICTUM_PHRASE_BIAS_TERMS",
+            Some(profile.phrase_bias_terms.join("\n")),
+            RuntimeEnvMode::Overwrite,
+        );
     }
 }
 
