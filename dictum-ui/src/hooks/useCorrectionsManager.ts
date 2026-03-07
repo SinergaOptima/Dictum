@@ -1,13 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ActiveAppContext, LearnedCorrection } from "@shared/ipc_types";
-import { deleteLearnedCorrection, getLearnedCorrections, learnCorrection } from "@/lib/tauri";
+import type { ActiveAppContext, AppProfile, LearnedCorrection } from "@shared/ipc_types";
+import {
+  deleteLearnedCorrection,
+  getLearnedCorrections,
+  learnCorrection,
+  pruneLearnedCorrections,
+} from "@/lib/tauri";
 
 type UseCorrectionsManagerOptions = {
   setRuntimeMsg: (msg: string | null) => void;
   activeAppContext: ActiveAppContext | null;
   currentDictationMode: "conversation" | "coding" | "command";
+  appProfiles: AppProfile[];
 };
 
 export type CorrectionScope = "global" | "mode" | "profile";
@@ -25,6 +31,17 @@ type EditingCorrection = {
   heard: string;
   corrected: string;
   scope: CorrectionScope;
+};
+
+export type CorrectionHealthSummary = {
+  totalRules: number;
+  globalRules: number;
+  modeRules: number;
+  profileRules: number;
+  currentContextRules: number;
+  unusedRules: number;
+  orphanedProfileRules: number;
+  staleRules: number;
 };
 
 function normalizeImportedCorrection(
@@ -109,6 +126,7 @@ export function useCorrectionsManager({
   setRuntimeMsg,
   activeAppContext,
   currentDictationMode,
+  appProfiles,
 }: UseCorrectionsManagerOptions) {
   const [learnedCorrections, setLearnedCorrections] = useState<LearnedCorrection[]>([]);
   const [correctionsCopied, setCorrectionsCopied] = useState<"idle" | "done" | "error">("idle");
@@ -137,6 +155,52 @@ export function useCorrectionsManager({
     () => resolveCorrectionContext(correctionScope, currentDictationMode, activeAppContext),
     [activeAppContext, correctionScope, currentDictationMode],
   );
+
+  const profileIds = useMemo(() => new Set(appProfiles.map((profile) => profile.id)), [appProfiles]);
+
+  const correctionHealthSummary = useMemo<CorrectionHealthSummary>(() => {
+    let globalRules = 0;
+    let modeRules = 0;
+    let profileRules = 0;
+    let currentContextRules = 0;
+    let unusedRules = 0;
+    let orphanedProfileRules = 0;
+    let staleRules = 0;
+    const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+
+    for (const rule of learnedCorrections) {
+      const scope = resolveRuleScope(rule);
+      if (scope === "global") globalRules += 1;
+      if (scope === "mode") modeRules += 1;
+      if (scope === "profile") profileRules += 1;
+      if (matchesCurrentContext(rule, activeAppContext, currentDictationMode)) {
+        currentContextRules += 1;
+      }
+      if (rule.hits <= 1 && !rule.lastUsedAt) {
+        unusedRules += 1;
+      }
+      if (rule.appProfileAffinity && !profileIds.has(rule.appProfileAffinity)) {
+        orphanedProfileRules += 1;
+      }
+      if (rule.hits <= 2 && rule.lastUsedAt) {
+        const ageMs = Date.now() - new Date(rule.lastUsedAt).getTime();
+        if (Number.isFinite(ageMs) && ageMs >= ninetyDaysMs) {
+          staleRules += 1;
+        }
+      }
+    }
+
+    return {
+      totalRules: learnedCorrections.length,
+      globalRules,
+      modeRules,
+      profileRules,
+      currentContextRules,
+      unusedRules,
+      orphanedProfileRules,
+      staleRules,
+    };
+  }, [activeAppContext, appProfiles, currentDictationMode, learnedCorrections, profileIds]);
 
   const filteredLearnedCorrections = useMemo(() => {
     const query = correctionFilter.trim().toLowerCase();
@@ -357,6 +421,13 @@ export function useCorrectionsManager({
         throw new Error("No learned corrections found in the pasted JSON.");
       }
       const normalized = parsed.map((rule, index) => normalizeImportedCorrection(rule, index));
+      normalized.forEach((rule, index) => {
+        if (rule.appProfileAffinity && !profileIds.has(rule.appProfileAffinity)) {
+          throw new Error(
+            `Correction ${index + 1}: appProfileAffinity "${rule.appProfileAffinity}" does not match any saved app profile.`,
+          );
+        }
+      });
       let latest = learnedCorrections;
       for (const rule of normalized) {
         latest = await upsertCorrection(
@@ -373,7 +444,31 @@ export function useCorrectionsManager({
       const msg = err instanceof Error ? err.message : String(err);
       setRuntimeMsg(`Failed to import learned corrections: ${msg}`);
     }
-  }, [correctionsImportText, learnedCorrections, setRuntimeMsg, upsertCorrection]);
+  }, [correctionsImportText, learnedCorrections, profileIds, setRuntimeMsg, upsertCorrection]);
+
+  const handlePruneCorrections = useCallback(
+    async (mode: "unused" | "orphaned" | "stale") => {
+      try {
+        const result = await pruneLearnedCorrections(
+          mode === "unused",
+          mode === "orphaned",
+          mode === "stale",
+        );
+        setLearnedCorrections(result.rules);
+        const removed =
+          result.removedUnused + result.removedOrphanedProfiles + result.removedStale;
+        setRuntimeMsg(
+          removed > 0
+            ? `Pruned ${removed} correction rule${removed === 1 ? "" : "s"} (${result.removedUnused} unused, ${result.removedOrphanedProfiles} orphaned, ${result.removedStale} stale).`
+            : "No correction rules matched that prune filter.",
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setRuntimeMsg(`Failed to prune corrections: ${msg}`);
+      }
+    },
+    [setRuntimeMsg],
+  );
 
   return {
     learnedCorrections,
@@ -393,6 +488,7 @@ export function useCorrectionsManager({
     correctionSort,
     setCorrectionSort,
     activeCorrectionContext,
+    correctionHealthSummary,
     filteredLearnedCorrections,
     editingCorrection: editingCorrection?.original ?? null,
     applyCorrection,
@@ -402,5 +498,6 @@ export function useCorrectionsManager({
     handleCancelEditingCorrection,
     handleCopyCorrections,
     handleImportCorrections,
+    handlePruneCorrections,
   };
 }

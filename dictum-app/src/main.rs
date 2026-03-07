@@ -953,6 +953,7 @@ fn main() {
             commands::set_runtime_settings,
             commands::get_learned_corrections,
             commands::learn_correction,
+            commands::prune_learned_corrections,
             commands::delete_learned_correction,
             commands::get_app_profiles,
             commands::upsert_app_profile,

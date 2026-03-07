@@ -113,8 +113,19 @@ pub struct CorrectionDiagnostics {
     pub mode_scoped_rules: usize,
     pub profile_scoped_rules: usize,
     pub unused_rules: usize,
+    pub orphaned_profile_rules: usize,
+    pub stale_rules: usize,
     pub top_rules: Vec<CorrectionRuleSummary>,
     pub recent_rules: Vec<CorrectionRuleSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionPruneResult {
+    pub rules: Vec<LearnedCorrection>,
+    pub removed_unused: usize,
+    pub removed_orphaned_profiles: usize,
+    pub removed_stale: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -816,6 +827,11 @@ pub async fn learn_correction(
     }
 
     let mut settings = state.settings.lock();
+    if let Some(profile_id) = app_profile_affinity.as_deref() {
+        if !settings.app_profiles.iter().any(|profile| profile.id == profile_id) {
+            return Err("The selected app profile no longer exists. Save this correction as Global or Mode, or recreate the profile.".into());
+        }
+    }
     if let Some(existing) = settings
         .learned_corrections
         .iter_mut()
@@ -855,6 +871,63 @@ pub async fn learn_correction(
     drop(settings);
     *state.learned_corrections.write() = updated.clone();
     Ok(updated)
+}
+
+/// Remove stale, unused, or orphaned learned correction rules in one pass.
+#[tauri::command]
+pub async fn prune_learned_corrections(
+    state: State<'_, AppState>,
+    remove_unused: Option<bool>,
+    remove_orphaned_profiles: Option<bool>,
+    remove_stale: Option<bool>,
+) -> Result<CorrectionPruneResult, String> {
+    let remove_unused = remove_unused.unwrap_or(false);
+    let remove_orphaned_profiles = remove_orphaned_profiles.unwrap_or(false);
+    let remove_stale = remove_stale.unwrap_or(false);
+    if !remove_unused && !remove_orphaned_profiles && !remove_stale {
+        return Err("Select at least one correction prune filter.".into());
+    }
+
+    let mut settings = state.settings.lock();
+    let valid_profile_ids = settings
+        .app_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut removed_unused_count = 0usize;
+    let mut removed_orphaned_count = 0usize;
+    let mut removed_stale_count = 0usize;
+    settings.learned_corrections.retain(|rule| {
+        let is_unused = remove_unused && rule_is_unused(rule);
+        let is_orphaned = remove_orphaned_profiles
+            && rule
+                .app_profile_affinity
+                .as_ref()
+                .is_some_and(|profile_id| !valid_profile_ids.contains(profile_id));
+        let is_stale = remove_stale && rule_is_stale(rule);
+        if is_unused {
+            removed_unused_count += 1;
+        }
+        if is_orphaned {
+            removed_orphaned_count += 1;
+        }
+        if is_stale {
+            removed_stale_count += 1;
+        }
+        !(is_unused || is_orphaned || is_stale)
+    });
+    settings.normalize();
+    save_settings(&state.settings_path, &settings).map_err(|e| e.to_string())?;
+
+    let updated = settings.learned_corrections.clone();
+    drop(settings);
+    *state.learned_corrections.write() = updated.clone();
+    Ok(CorrectionPruneResult {
+        rules: updated,
+        removed_unused: removed_unused_count,
+        removed_orphaned_profiles: removed_orphaned_count,
+        removed_stale: removed_stale_count,
+    })
 }
 
 /// Remove learned correction rules for `heard` (and optionally specific `corrected`).
@@ -991,6 +1064,116 @@ fn current_active_app_context(settings: &crate::settings::AppSettings) -> Active
         post_utterance_refine: matched_profile
             .map(|profile| profile.post_utterance_refine)
             .unwrap_or(settings.post_utterance_refine),
+    }
+}
+
+fn rule_has_valid_profile(
+    settings: &crate::settings::AppSettings,
+    rule: &LearnedCorrection,
+) -> bool {
+    match rule.app_profile_affinity.as_deref() {
+        Some(profile_id) => settings.app_profiles.iter().any(|profile| profile.id == profile_id),
+        None => true,
+    }
+}
+
+fn rule_is_unused(rule: &LearnedCorrection) -> bool {
+    rule.hits <= 1 && rule.last_used_at.is_none()
+}
+
+fn rule_is_stale(rule: &LearnedCorrection) -> bool {
+    if rule.hits > 2 {
+        return false;
+    }
+    let Some(last_used_at) = rule.last_used_at.as_deref() else {
+        return false;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(last_used_at) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    age.num_days() >= 90
+}
+
+fn build_correction_diagnostics(settings: &crate::settings::AppSettings) -> CorrectionDiagnostics {
+    let summarize_rule = |rule: &LearnedCorrection| CorrectionRuleSummary {
+        heard: rule.heard.clone(),
+        corrected: rule.corrected.clone(),
+        hits: rule.hits,
+        mode_affinity: rule.mode_affinity.clone(),
+        app_profile_affinity: rule.app_profile_affinity.clone(),
+        app_profile_name: rule.app_profile_affinity.as_ref().and_then(|id| {
+            settings
+                .app_profiles
+                .iter()
+                .find(|profile| profile.id == *id)
+                .map(|profile| profile.name.clone())
+        }),
+        last_used_at: rule.last_used_at.clone(),
+    };
+    let mut top_rule_refs = settings.learned_corrections.iter().collect::<Vec<_>>();
+    top_rule_refs.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
+    let top_rules = top_rule_refs
+        .into_iter()
+        .take(12)
+        .map(summarize_rule)
+        .collect::<Vec<_>>();
+    let mut recent_rule_refs = settings
+        .learned_corrections
+        .iter()
+        .filter(|rule| rule.last_used_at.is_some())
+        .collect::<Vec<_>>();
+    recent_rule_refs.sort_by(|a, b| {
+        b.last_used_at
+            .cmp(&a.last_used_at)
+            .then_with(|| b.hits.cmp(&a.hits))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
+    let recent_rules = recent_rule_refs
+        .into_iter()
+        .take(8)
+        .map(summarize_rule)
+        .collect::<Vec<_>>();
+
+    CorrectionDiagnostics {
+        total_rules: settings.learned_corrections.len(),
+        global_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.mode_affinity.is_none() && rule.app_profile_affinity.is_none())
+            .count(),
+        mode_scoped_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.mode_affinity.is_some() && rule.app_profile_affinity.is_none())
+            .count(),
+        profile_scoped_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule.app_profile_affinity.is_some())
+            .count(),
+        unused_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule_is_unused(rule))
+            .count(),
+        orphaned_profile_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| !rule_has_valid_profile(settings, rule))
+            .count(),
+        stale_rules: settings
+            .learned_corrections
+            .iter()
+            .filter(|rule| rule_is_stale(rule))
+            .count(),
+        top_rules,
+        recent_rules,
     }
 }
 
@@ -1150,74 +1333,7 @@ pub async fn get_diagnostics_bundle(
         retention_days: runtime_settings.retention_days,
         cloud_opt_in: runtime_settings.cloud_opt_in,
     };
-    let summarize_rule = |rule: &LearnedCorrection| CorrectionRuleSummary {
-            heard: rule.heard.clone(),
-            corrected: rule.corrected.clone(),
-            hits: rule.hits,
-            mode_affinity: rule.mode_affinity.clone(),
-            app_profile_affinity: rule.app_profile_affinity.clone(),
-            app_profile_name: rule.app_profile_affinity.as_ref().and_then(|id| {
-                settings
-                    .app_profiles
-                    .iter()
-                    .find(|profile| profile.id == *id)
-                    .map(|profile| profile.name.clone())
-            }),
-            last_used_at: rule.last_used_at.clone(),
-        };
-    let mut top_rule_refs = settings.learned_corrections.iter().collect::<Vec<_>>();
-    top_rule_refs.sort_by(|a, b| {
-        b.hits
-            .cmp(&a.hits)
-            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
-            .then_with(|| a.heard.cmp(&b.heard))
-    });
-    let top_rules = top_rule_refs
-        .into_iter()
-        .take(12)
-        .map(summarize_rule)
-        .collect::<Vec<_>>();
-    let mut recent_rule_refs = settings
-        .learned_corrections
-        .iter()
-        .filter(|rule| rule.last_used_at.is_some())
-        .collect::<Vec<_>>();
-    recent_rule_refs.sort_by(|a, b| {
-        b.last_used_at
-            .cmp(&a.last_used_at)
-            .then_with(|| b.hits.cmp(&a.hits))
-            .then_with(|| a.heard.cmp(&b.heard))
-    });
-    let recent_rules = recent_rule_refs
-        .into_iter()
-        .take(8)
-        .map(summarize_rule)
-        .collect::<Vec<_>>();
-    let correction_diagnostics = CorrectionDiagnostics {
-        total_rules: settings.learned_corrections.len(),
-        global_rules: settings
-            .learned_corrections
-            .iter()
-            .filter(|rule| rule.mode_affinity.is_none() && rule.app_profile_affinity.is_none())
-            .count(),
-        mode_scoped_rules: settings
-            .learned_corrections
-            .iter()
-            .filter(|rule| rule.mode_affinity.is_some() && rule.app_profile_affinity.is_none())
-            .count(),
-        profile_scoped_rules: settings
-            .learned_corrections
-            .iter()
-            .filter(|rule| rule.app_profile_affinity.is_some())
-            .count(),
-        unused_rules: settings
-            .learned_corrections
-            .iter()
-            .filter(|rule| rule.hits <= 1 && rule.last_used_at.is_none())
-            .count(),
-        top_rules,
-        recent_rules,
-    };
+    let correction_diagnostics = build_correction_diagnostics(&settings);
     let update_repo_slug =
         normalize_repo_slug(None).unwrap_or_else(|_| DEFAULT_UPDATE_REPO_SLUG.to_string());
     drop(settings);
@@ -1383,10 +1499,10 @@ pub async fn delete_snippet(state: State<'_, AppState>, id: String) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        correction_matches_delete_target, normalize_repo_slug, parse_sha256_from_sums,
+        build_correction_diagnostics, correction_matches_delete_target, normalize_repo_slug, parse_sha256_from_sums,
         select_checksums_asset, select_installer_asset, version_tuple, GitHubAsset,
     };
-    use crate::settings::LearnedCorrection;
+    use crate::settings::{AppProfile, AppSettings, LearnedCorrection};
 
     fn asset(name: &str) -> GitHubAsset {
         GitHubAsset {
@@ -1512,5 +1628,44 @@ mod tests {
             None,
             None,
         ));
+    }
+
+    #[test]
+    fn correction_diagnostics_count_orphaned_and_stale_rules() {
+        let mut settings = AppSettings::default();
+        settings.app_profiles = vec![AppProfile {
+            id: "cursor-profile".into(),
+            name: "Cursor".into(),
+            app_match: "cursor.exe".into(),
+            dictation_mode: "coding".into(),
+            phrase_bias_terms: Vec::new(),
+            post_utterance_refine: false,
+            enabled: true,
+        }];
+        settings.learned_corrections = vec![
+            LearnedCorrection {
+                heard: "printf".into(),
+                corrected: "println!".into(),
+                hits: 1,
+                mode_affinity: Some("coding".into()),
+                app_profile_affinity: Some("missing-profile".into()),
+                last_used_at: None,
+            },
+            LearnedCorrection {
+                heard: "ship it".into(),
+                corrected: "ShipIt".into(),
+                hits: 2,
+                mode_affinity: None,
+                app_profile_affinity: None,
+                last_used_at: Some("2025-10-01T10:00:00Z".into()),
+            },
+        ];
+        settings.normalize();
+
+        let diagnostics = build_correction_diagnostics(&settings);
+        assert_eq!(diagnostics.total_rules, 2);
+        assert_eq!(diagnostics.unused_rules, 1);
+        assert_eq!(diagnostics.orphaned_profile_rules, 1);
+        assert_eq!(diagnostics.stale_rules, 1);
     }
 }

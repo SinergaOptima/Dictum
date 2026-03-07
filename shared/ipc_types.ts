@@ -264,6 +264,13 @@ export interface LearnedCorrection {
   lastUsedAt?: string | null;
 }
 
+export interface CorrectionPruneResult {
+  rules: LearnedCorrection[];
+  removedUnused: number;
+  removedOrphanedProfiles: number;
+  removedStale: number;
+}
+
 // ---------------------------------------------------------------------------
 // History / stats / dictionary / snippets
 // ---------------------------------------------------------------------------
@@ -396,6 +403,8 @@ export interface DiagnosticsBundle {
     modeScopedRules: number;
     profileScopedRules: number;
     unusedRules: number;
+    orphanedProfileRules: number;
+    staleRules: number;
     topRules: Array<{
       heard: string;
       corrected: string;

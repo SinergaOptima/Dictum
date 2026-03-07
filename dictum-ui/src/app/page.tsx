@@ -373,6 +373,7 @@ export default function Home() {
     correctionSort,
     setCorrectionSort,
     activeCorrectionContext,
+    correctionHealthSummary,
     filteredLearnedCorrections,
     editingCorrection,
     applyCorrection,
@@ -382,10 +383,12 @@ export default function Home() {
     handleCancelEditingCorrection,
     handleCopyCorrections,
     handleImportCorrections,
+    handlePruneCorrections,
   } = useCorrectionsManager({
     setRuntimeMsg,
     activeAppContext,
     currentDictationMode: dictationMode,
+    appProfiles,
   });
   const copyText = useMemo(() => {
     const finals = segments.filter((seg) => seg.kind === "final");
@@ -1099,17 +1102,7 @@ export default function Home() {
   const duplicateFinalSuppressed = perfSnapshot?.diagnostics.duplicateFinalSuppressed ?? 0;
   const partialRescuesUsed = perfSnapshot?.diagnostics.partialRescuesUsed ?? 0;
   const correctionDiagnostics = diagnosticsBundle?.correctionDiagnostics ?? null;
-  const currentContextRuleCount = useMemo(
-    () =>
-      learnedCorrections.filter((rule) =>
-        matchesCorrectionContext(
-          rule,
-          activeAppContext?.matchedProfileId ?? null,
-          effectiveSuggestionMode,
-        ),
-      ).length,
-    [activeAppContext?.matchedProfileId, effectiveSuggestionMode, learnedCorrections],
-  );
+  const currentContextRuleCount = correctionHealthSummary.currentContextRules;
   const readinessItems = useMemo(
     () => [
       {
@@ -1142,8 +1135,10 @@ export default function Home() {
       {
         label: "Corrections",
         value: `${learnedCorrections.length} rules`,
-        ok: learnedCorrections.length > 0,
-        detail: `${currentContextRuleCount} rules match the current context.`,
+        ok:
+          learnedCorrections.length > 0 &&
+          correctionHealthSummary.orphanedProfileRules === 0,
+        detail: `${currentContextRuleCount} rules match the current context. ${correctionHealthSummary.orphanedProfileRules} orphaned, ${correctionHealthSummary.staleRules} stale.`,
       },
       {
         label: "Diagnostics export",
@@ -1161,6 +1156,8 @@ export default function Home() {
     [
       activeAppContext?.foregroundApp,
       activeAppContext?.matchedProfileName,
+      correctionHealthSummary.orphanedProfileRules,
+      correctionHealthSummary.staleRules,
       currentContextRuleCount,
       guidedTuneCompletedForDevice,
       lastDiagnosticsExportPath,
@@ -1614,6 +1611,12 @@ export default function Home() {
                     <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
                       <b>{correctionDiagnostics?.unusedRules ?? 0}</b><span>Unused Rules</span>
                     </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.orphanedProfileRules ?? correctionHealthSummary.orphanedProfileRules}</b><span>Orphaned Profile Rules</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.staleRules ?? correctionHealthSummary.staleRules}</b><span>Stale Rules</span>
+                    </motion.div>
                   </motion.div>
                   {correctionDiagnostics && (
                   <div className="settings-stack">
@@ -1631,6 +1634,12 @@ export default function Home() {
                         </div>
                         <div className="stat-card">
                           <b>{correctionDiagnostics.profileScopedRules}</b><span>Profile Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.orphanedProfileRules}</b><span>Orphaned Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.staleRules}</b><span>Stale Rules</span>
                         </div>
                         <div className="stat-card">
                           <b>{diagnosticsBundle?.activeAppContext.foregroundApp || "none"}</b><span>Foreground App</span>
@@ -2297,6 +2306,7 @@ export default function Home() {
                   correctionScope={correctionScope}
                   correctionFilterScope={correctionFilterScope}
                   correctionSort={correctionSort}
+                  correctionHealthSummary={correctionHealthSummary}
                   editingCorrection={editingCorrection}
                   onCorrectionHeardInputChange={setCorrectionHeardInput}
                   onCorrectionFixedInputChange={setCorrectionFixedInput}
@@ -2308,6 +2318,7 @@ export default function Home() {
                   onLearnCorrection={handleLearnCorrection}
                   onCopyCorrections={handleCopyCorrections}
                   onImportCorrections={handleImportCorrections}
+                  onPruneCorrections={handlePruneCorrections}
                   onDeleteCorrection={handleDeleteCorrection}
                   onStartEditingCorrection={handleStartEditingCorrection}
                   onCancelEditingCorrection={handleCancelEditingCorrection}

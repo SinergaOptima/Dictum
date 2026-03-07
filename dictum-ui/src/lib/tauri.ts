@@ -31,6 +31,7 @@ import type {
   AppProfile,
   ActiveAppContext,
   LearnedCorrection,
+  CorrectionPruneResult,
 } from "@shared/ipc_types";
 
 // ---------------------------------------------------------------------------
@@ -259,6 +260,17 @@ export const deleteLearnedCorrection = (
     corrected: corrected ?? null,
     modeAffinity: modeAffinity ?? null,
     appProfileAffinity: appProfileAffinity ?? null,
+  });
+
+export const pruneLearnedCorrections = (
+  removeUnused?: boolean | null,
+  removeOrphanedProfiles?: boolean | null,
+  removeStale?: boolean | null,
+): Promise<CorrectionPruneResult> =>
+  tauriInvoke("prune_learned_corrections", {
+    removeUnused: removeUnused ?? null,
+    removeOrphanedProfiles: removeOrphanedProfiles ?? null,
+    removeStale: removeStale ?? null,
   });
 
 export const getAppProfiles = (): Promise<AppProfile[]> =>

@@ -3,6 +3,7 @@
 import type { ActiveAppContext, AppProfile, LearnedCorrection } from "@shared/ipc_types";
 import type {
   CorrectionFilterScope,
+  CorrectionHealthSummary,
   CorrectionScope,
   CorrectionSort,
 } from "@/hooks/useCorrectionsManager";
@@ -21,6 +22,7 @@ type LiveCorrectionsSectionProps = {
   correctionScope: CorrectionScope;
   correctionFilterScope: CorrectionFilterScope;
   correctionSort: CorrectionSort;
+  correctionHealthSummary: CorrectionHealthSummary;
   editingCorrection: LearnedCorrection | null;
   onCorrectionHeardInputChange: (value: string) => void;
   onCorrectionFixedInputChange: (value: string) => void;
@@ -32,6 +34,7 @@ type LiveCorrectionsSectionProps = {
   onLearnCorrection: () => void | Promise<void>;
   onCopyCorrections: () => void | Promise<void>;
   onImportCorrections: () => void | Promise<void>;
+  onPruneCorrections: (mode: "unused" | "orphaned" | "stale") => void | Promise<void>;
   onDeleteCorrection: (rule: LearnedCorrection) => void | Promise<void>;
   onStartEditingCorrection: (rule: LearnedCorrection) => void | Promise<void>;
   onCancelEditingCorrection: () => void | Promise<void>;
@@ -57,6 +60,7 @@ export function LiveCorrectionsSection({
   correctionScope,
   correctionFilterScope,
   correctionSort,
+  correctionHealthSummary,
   editingCorrection,
   onCorrectionHeardInputChange,
   onCorrectionFixedInputChange,
@@ -68,6 +72,7 @@ export function LiveCorrectionsSection({
   onLearnCorrection,
   onCopyCorrections,
   onImportCorrections,
+  onPruneCorrections,
   onDeleteCorrection,
   onStartEditingCorrection,
   onCancelEditingCorrection,
@@ -119,6 +124,25 @@ export function LiveCorrectionsSection({
               : "Copy JSON"}
         </button>
         <span className="settings-note">{learnedCorrections.length} learned rules</span>
+      </div>
+      <div className="settings-inline-stats">
+        <span>{correctionHealthSummary.globalRules} global</span>
+        <span>{correctionHealthSummary.modeRules} mode</span>
+        <span>{correctionHealthSummary.profileRules} profile</span>
+        <span>{correctionHealthSummary.currentContextRules} current context</span>
+        <span>{correctionHealthSummary.orphanedProfileRules} orphaned</span>
+        <span>{correctionHealthSummary.staleRules} stale</span>
+      </div>
+      <div className="settings-inline-actions">
+        <button className="action-btn secondary" onClick={() => void onPruneCorrections("unused")} type="button">
+          Prune Unused
+        </button>
+        <button className="action-btn secondary" onClick={() => void onPruneCorrections("orphaned")} type="button">
+          Prune Orphaned
+        </button>
+        <button className="action-btn secondary" onClick={() => void onPruneCorrections("stale")} type="button">
+          Prune Stale
+        </button>
       </div>
       <div className="settings-field">
         <span>Correction Scope</span>
@@ -234,6 +258,7 @@ export function LiveCorrectionsSection({
           const profileName = rule.appProfileAffinity
             ? profileNameById.get(rule.appProfileAffinity) || rule.appProfileAffinity
             : null;
+          const isOrphaned = !!rule.appProfileAffinity && !profileNameById.has(rule.appProfileAffinity);
           const matchesCurrentContext = rule.appProfileAffinity
             ? rule.appProfileAffinity === activeProfileId
             : rule.modeAffinity
@@ -258,11 +283,14 @@ export function LiveCorrectionsSection({
                 <span>{ruleScope}</span>
                 {rule.modeAffinity && <span>{rule.modeAffinity}</span>}
                 {profileName && <span>{profileName}</span>}
+                {isOrphaned && <span>orphaned profile</span>}
                 <span>{matchesCurrentContext ? "matches current context" : "out of current context"}</span>
               </div>
               <p>
                 {ruleScope === "profile"
-                  ? `Profile ${profileName}`
+                  ? isOrphaned
+                    ? `Profile ${rule.appProfileAffinity} no longer exists`
+                    : `Profile ${profileName}`
                   : ruleScope === "mode"
                     ? `Mode ${rule.modeAffinity}`
                     : "All apps and modes"}
