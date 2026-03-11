@@ -216,6 +216,18 @@ function buildInitScript(config) {
           buckets: []
         },
         historyPage: { items: [], total: 0, page: 1, pageSize: 50 },
+        snippets: [
+          {
+            id: "snip-1",
+            trigger: "/standup",
+            expansion: "Daily standup update",
+            mode: "slash",
+            applyModes: ["conversation"],
+            enabled: true,
+            createdAt: "2026-03-07T12:00:00Z",
+            updatedAt: "2026-03-07T12:00:00Z"
+          }
+        ],
         diagnosticsBundle: null,
         updateInfo: {
           currentVersion,
@@ -350,8 +362,9 @@ function buildInitScript(config) {
             case "get_history":
               return state.historyPage;
             case "get_dictionary":
-            case "get_snippets":
               return [];
+            case "get_snippets":
+              return state.snippets;
             case "get_diagnostics_bundle":
               return state.diagnosticsBundle;
             case "export_diagnostics_bundle":
@@ -377,6 +390,23 @@ function buildInitScript(config) {
               state.appProfiles = state.appProfiles.filter((p) => p.id !== args.id);
               refreshDiagnostics();
               return state.appProfiles;
+            case "upsert_snippet": {
+              const entry = args.entry;
+              const normalized = {
+                ...entry,
+                id: entry.id || ("snip-" + Math.floor(Math.random() * 100000)),
+                applyModes: Array.isArray(entry.applyModes) ? entry.applyModes : [],
+                createdAt: entry.createdAt || new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              };
+              const idx = state.snippets.findIndex((snippet) => snippet.id === normalized.id);
+              if (idx >= 0) state.snippets[idx] = normalized;
+              else state.snippets.unshift(normalized);
+              return normalized;
+            }
+            case "delete_snippet":
+              state.snippets = state.snippets.filter((snippet) => snippet.id !== args.id);
+              return null;
             case "learn_correction": {
               state.learnedCorrections.push({
                 heard: args.heard,
@@ -555,6 +585,18 @@ async function runSettingsAndStatsSmoke(browser) {
   await page.getByRole("button", { name: /export file/i }).click();
   await assertText(page, "Diagnostics export");
   await assertText(page, "Exported");
+
+  await page.getByRole("button", { name: /snippets/i }).click();
+  const standupSnippet = page.locator("article").filter({ hasText: "/standup" }).first();
+  await standupSnippet.waitFor({ timeout: 10000 });
+  await standupSnippet.getByText("conversation", { exact: true }).waitFor({ timeout: 10000 });
+  await page.getByPlaceholder("Trigger (e.g. /email)").fill("/deploy");
+  await page.getByPlaceholder("Expansion text").fill("kubectl apply -f deploy.yaml");
+  await page.getByRole("button", { name: /^command$/i }).click();
+  await page.getByRole("button", { name: /^add$/i }).click();
+  const deploySnippet = page.locator("article").filter({ hasText: "/deploy" }).first();
+  await deploySnippet.waitFor({ timeout: 10000 });
+  await deploySnippet.getByText("command", { exact: true }).waitFor({ timeout: 10000 });
 
   await page.close();
   await context.close();

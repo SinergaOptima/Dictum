@@ -77,6 +77,7 @@ pub struct SnippetEntry {
     pub expansion: String,
     /// "slash" | "phrase"
     pub mode: String,
+    pub apply_modes: Vec<String>,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -243,6 +244,7 @@ impl LocalStore {
               trigger TEXT NOT NULL UNIQUE,
               expansion TEXT NOT NULL,
               mode TEXT NOT NULL,
+              apply_modes_json TEXT NOT NULL DEFAULT '[]',
               enabled INTEGER NOT NULL DEFAULT 1,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
@@ -254,6 +256,7 @@ impl LocalStore {
             "#,
         )
         .map_err(|e| e.to_string())?;
+        ensure_text_column_with_default(&conn, "snippets", "apply_modes_json", "'[]'")?;
         Ok(())
     }
 
@@ -588,21 +591,26 @@ impl LocalStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, trigger, expansion, mode, enabled, created_at, updated_at
+                "SELECT id, trigger, expansion, mode, apply_modes_json, enabled, created_at, updated_at
                  FROM snippets ORDER BY updated_at DESC",
             )
             .map_err(|e| e.to_string())?;
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let apply_modes_json: String = row.get(4).map_err(|e| e.to_string())?;
+            let apply_modes = normalize_apply_modes(
+                &serde_json::from_str::<Vec<String>>(&apply_modes_json).unwrap_or_default(),
+            );
             out.push(SnippetEntry {
                 id: row.get(0).map_err(|e| e.to_string())?,
                 trigger: row.get(1).map_err(|e| e.to_string())?,
                 expansion: row.get(2).map_err(|e| e.to_string())?,
                 mode: row.get(3).map_err(|e| e.to_string())?,
-                enabled: row.get::<_, i64>(4).map_err(|e| e.to_string())? != 0,
-                created_at: ts_to_rfc3339(row.get::<_, i64>(5).map_err(|e| e.to_string())?),
-                updated_at: ts_to_rfc3339(row.get::<_, i64>(6).map_err(|e| e.to_string())?),
+                apply_modes,
+                enabled: row.get::<_, i64>(5).map_err(|e| e.to_string())? != 0,
+                created_at: ts_to_rfc3339(row.get::<_, i64>(6).map_err(|e| e.to_string())?),
+                updated_at: ts_to_rfc3339(row.get::<_, i64>(7).map_err(|e| e.to_string())?),
             });
         }
         Ok(out)
@@ -620,16 +628,20 @@ impl LocalStore {
             _ => "slash",
         };
         entry.mode = mode.to_string();
+        entry.apply_modes = normalize_apply_modes(&entry.apply_modes);
+        let apply_modes_json =
+            serde_json::to_string(&entry.apply_modes).map_err(|e| e.to_string())?;
 
         let conn = self.open()?;
         conn.execute(
             r#"
-            INSERT INTO snippets (id, trigger, expansion, mode, enabled, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT created_at FROM snippets WHERE id = ?1), ?6), ?7)
+            INSERT INTO snippets (id, trigger, expansion, mode, apply_modes_json, enabled, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE((SELECT created_at FROM snippets WHERE id = ?1), ?7), ?8)
             ON CONFLICT(id) DO UPDATE SET
                 trigger = excluded.trigger,
                 expansion = excluded.expansion,
                 mode = excluded.mode,
+                apply_modes_json = excluded.apply_modes_json,
                 enabled = excluded.enabled,
                 updated_at = excluded.updated_at
             "#,
@@ -638,6 +650,7 @@ impl LocalStore {
                 entry.trigger.trim(),
                 entry.expansion.trim(),
                 entry.mode,
+                apply_modes_json,
                 if entry.enabled { 1_i64 } else { 0_i64 },
                 now,
                 now,
@@ -689,6 +702,46 @@ fn new_id(prefix: &str) -> String {
         Utc::now().timestamp_micros(),
         rand::random::<u32>()
     )
+}
+
+fn ensure_text_column_with_default(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    default_sql: &str,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let existing: String = row.get(1).map_err(|e| e.to_string())?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT {default_sql}"),
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn normalize_apply_modes(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for mode in raw {
+        let normalized = match mode.trim().to_ascii_lowercase().as_str() {
+            "coding" | "code" => "coding",
+            "command" | "commands" => "command",
+            "conversation" | "general" | "default" => "conversation",
+            _ => continue,
+        };
+        if !out.iter().any(|entry: &String| entry == normalized) {
+            out.push(normalized.to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

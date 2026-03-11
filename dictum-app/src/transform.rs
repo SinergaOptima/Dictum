@@ -97,6 +97,9 @@ impl TextTransform {
 
         let mut snippet_applied = false;
         for snippet in guard.snippets.iter().filter(|s| s.enabled) {
+            if !snippet_applies_in_mode(snippet, mode) {
+                continue;
+            }
             let trigger = snippet.trigger.trim();
             let expansion = snippet.expansion.trim();
             if trigger.is_empty() || expansion.is_empty() {
@@ -123,6 +126,16 @@ impl TextTransform {
             snippet_applied,
         }
     }
+}
+
+fn snippet_applies_in_mode(snippet: &SnippetEntry, mode: DictationMode) -> bool {
+    if snippet.apply_modes.is_empty() {
+        return true;
+    }
+    snippet
+        .apply_modes
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(mode.as_str()))
 }
 
 fn replace_slash_trigger(text: &str, trigger: &str, replacement: &str) -> String {
@@ -276,7 +289,9 @@ fn ensure_terminal_punctuation(text: &str, default: char) -> String {
 }
 
 fn strip_trailing_sentence_punctuation(text: &str) -> String {
-    text.trim_end_matches(|c| matches!(c, '.' | '!' | '?')).trim_end().to_string()
+    text.trim_end_matches(|c| matches!(c, '.' | '!' | '?'))
+        .trim_end()
+        .to_string()
 }
 
 fn apply_coding_replacements(text: &str) -> String {
@@ -325,21 +340,31 @@ fn apply_command_replacements(text: &str) -> String {
 
 fn collapse_symbol_spacing(text: &str) -> String {
     let mut out = text.to_string();
-    for token in [",", ".", ":", ";", ")", "]", "}", "(", "[", "{", "_", "-", "=", "/", "\\"] {
+    for token in [
+        ",", ".", ":", ";", ")", "]", "}", "(", "[", "{", "_", "-", "=", "/", "\\",
+    ] {
         out = out.replace(&format!(" {token}"), token);
         out = out.replace(&format!("{token} "), token);
     }
-    out.replace('\n', " \n ").replace(" \n ", "\n").trim().to_string()
+    out.replace('\n', " \n ")
+        .replace(" \n ", "\n")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_mode_transform, DictationMode};
+    use super::{apply_mode_transform, snippet_applies_in_mode, DictationMode};
+    use crate::storage::SnippetEntry;
 
     #[test]
     fn conversation_mode_adds_sentence_punctuation() {
         assert_eq!(
-            apply_mode_transform("hello there general kenobi", DictationMode::Conversation, false),
+            apply_mode_transform(
+                "hello there general kenobi",
+                DictationMode::Conversation,
+                false
+            ),
             "Hello there general kenobi."
         );
     }
@@ -359,9 +384,53 @@ mod tests {
     #[test]
     fn command_mode_lowercases_and_strips_trailing_punctuation() {
         assert_eq!(
-            apply_mode_transform("Git Commit Dash M Update README.", DictationMode::Command, false),
+            apply_mode_transform(
+                "Git Commit Dash M Update README.",
+                DictationMode::Command,
+                false
+            ),
             "git commit-m update readme"
         );
+    }
+
+    #[test]
+    fn snippet_mode_scope_defaults_to_all_modes_when_empty() {
+        let snippet = SnippetEntry {
+            id: "snip-1".into(),
+            trigger: "/sig".into(),
+            expansion: "Thanks".into(),
+            mode: "slash".into(),
+            apply_modes: Vec::new(),
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        assert!(snippet_applies_in_mode(
+            &snippet,
+            DictationMode::Conversation
+        ));
+        assert!(snippet_applies_in_mode(&snippet, DictationMode::Coding));
+    }
+
+    #[test]
+    fn snippet_mode_scope_blocks_non_matching_modes() {
+        let snippet = SnippetEntry {
+            id: "snip-2".into(),
+            trigger: "/deploy".into(),
+            expansion: "kubectl apply".into(),
+            mode: "slash".into(),
+            apply_modes: vec!["command".into()],
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        assert!(snippet_applies_in_mode(&snippet, DictationMode::Command));
+        assert!(!snippet_applies_in_mode(
+            &snippet,
+            DictationMode::Conversation
+        ));
     }
 }
 

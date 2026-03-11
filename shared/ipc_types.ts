@@ -326,6 +326,7 @@ export interface SnippetEntry {
   trigger: string;
   expansion: string;
   mode: "slash" | "phrase";
+  applyModes: Array<"conversation" | "coding" | "command" | string>;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;

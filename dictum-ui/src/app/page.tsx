@@ -196,6 +196,9 @@ const DICTATION_MODE_OPTIONS: Array<{ value: DictationMode; label: string; hint:
   },
 ];
 
+const toggleUniqueMode = (modes: DictationMode[], mode: DictationMode): DictationMode[] =>
+  modes.includes(mode) ? modes.filter((entry) => entry !== mode) : [...modes, mode];
+
 const APP_PROFILE_PRESETS: Array<{
   name: string;
   appMatch: string;
@@ -299,6 +302,7 @@ export default function Home() {
   const [snippetTrigger, setSnippetTrigger] = useState("");
   const [snippetExpansion, setSnippetExpansion] = useState("");
   const [snippetMode, setSnippetMode] = useState<"slash" | "phrase">("slash");
+  const [snippetApplyModes, setSnippetApplyModes] = useState<DictationMode[]>([]);
   const deferredSegments = useDeferredValue(segments);
   const {
     currentAppVersion,
@@ -1934,6 +1938,19 @@ export default function Home() {
                   <option value="slash">slash</option>
                   <option value="phrase">phrase</option>
                 </select>
+                <div className="settings-chip-row">
+                  {DICTATION_MODE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      className={`settings-chip-btn ${snippetApplyModes.includes(option.value) ? "is-active" : ""}`}
+                      onClick={() => setSnippetApplyModes((prev) => toggleUniqueMode(prev, option.value))}
+                      type="button"
+                      title={`Apply only in ${option.label.toLowerCase()} mode`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
                 <button
                   className="action-btn"
                   onClick={async () => {
@@ -1943,12 +1960,14 @@ export default function Home() {
                       trigger: snippetTrigger.trim(),
                       expansion: snippetExpansion.trim(),
                       mode: snippetMode,
+                      applyModes: snippetApplyModes,
                       enabled: true,
                       createdAt: "",
                       updatedAt: "",
                     });
                     setSnippetTrigger("");
                     setSnippetExpansion("");
+                    setSnippetApplyModes([]);
                     await refreshSnippets(true);
                   }}
                   disabled={panelLoading.snippets}
@@ -1956,6 +1975,9 @@ export default function Home() {
                   {panelLoading.snippets ? "Saving..." : "Add"}
                 </button>
               </div>
+              <p className="settings-note">
+                Leave mode chips unselected to apply a snippet everywhere. Select one or more modes to limit where the snippet expands.
+              </p>
               <div className="panel-list">
                 {panelLoading.snippets && snippets.length === 0 && (
                   <div className="empty-slate">
@@ -1975,6 +1997,11 @@ export default function Home() {
                     <div className="panel-meta">
                       <span>{entry.trigger}</span>
                       <span>{entry.mode}</span>
+                      <span>
+                        {entry.applyModes.length > 0
+                          ? entry.applyModes.join(", ")
+                          : "all modes"}
+                      </span>
                     </div>
                     <p>{entry.expansion}</p>
                     <div className="context-menu">
