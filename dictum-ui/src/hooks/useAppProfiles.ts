@@ -19,6 +19,15 @@ type UseAppProfilesOptions = {
   setRuntimeMsg: (msg: string | null) => void;
 };
 
+function titleCaseExecutableName(appMatch: string): string {
+  return appMatch
+    .replace(/\.exe$/i, "")
+    .split(/[^a-z0-9]+/i)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function normalizeExecutableMatch(value: string, index?: number): string {
   const trimmed = value.trim().replace(/^["']+|["']+$/g, "");
   const appMatch = trimmed.split(/[\\/]/).pop()?.trim().toLowerCase() ?? "";
@@ -184,6 +193,45 @@ export function useAppProfiles({ tab, setRuntimeMsg }: UseAppProfilesOptions) {
     setRuntimeMsg(`Loaded ${preset.name} preset into the profile editor.`);
   }, [setRuntimeMsg]);
 
+  const handleUseCurrentForegroundApp = useCallback(() => {
+    try {
+      const rawApp = activeAppContext?.foregroundApp?.trim();
+      if (!rawApp) {
+        setRuntimeMsg("No foreground app is available right now.");
+        return;
+      }
+      const appMatch = normalizeExecutableMatch(rawApp);
+      const existing = appProfiles.find((profile) => profile.appMatch === appMatch);
+      if (existing) {
+        setEditingAppProfileId(existing.id);
+        setAppProfileName(existing.name);
+        setAppProfileMatch(existing.appMatch);
+        setAppProfileMode(existing.dictationMode);
+        setAppProfileBiasTerms(existing.phraseBiasTerms.join("\n"));
+        setAppProfileRefine(existing.postUtteranceRefine);
+        setRuntimeMsg(`Loaded existing profile for ${appMatch}.`);
+        return;
+      }
+      setEditingAppProfileId(null);
+      setAppProfileName(titleCaseExecutableName(appMatch));
+      setAppProfileMatch(appMatch);
+      setRuntimeMsg(`Loaded the current foreground app (${appMatch}) into the profile editor.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Could not use the current foreground app: ${msg}`);
+    }
+  }, [activeAppContext?.foregroundApp, appProfiles, setRuntimeMsg]);
+
+  const handleDuplicateAppProfile = useCallback((profile: AppProfile) => {
+    setEditingAppProfileId(null);
+    setAppProfileName(`${profile.name} Copy`);
+    setAppProfileMatch("");
+    setAppProfileMode(profile.dictationMode);
+    setAppProfileBiasTerms(profile.phraseBiasTerms.join("\n"));
+    setAppProfileRefine(profile.postUtteranceRefine);
+    setRuntimeMsg(`Duplicated "${profile.name}" into the editor. Set a new app executable before saving.`);
+  }, [setRuntimeMsg]);
+
   const handleDeleteAppProfile = useCallback(async (id: string, name: string) => {
     try {
       const profiles = await deleteAppProfile(id);
@@ -278,6 +326,8 @@ export function useAppProfiles({ tab, setRuntimeMsg }: UseAppProfilesOptions) {
     handleEditAppProfile,
     resetAppProfileEditor,
     handleApplyAppProfilePreset,
+    handleUseCurrentForegroundApp,
+    handleDuplicateAppProfile,
     handleDeleteAppProfile,
     handleCopyAppProfiles,
     handleImportAppProfiles,

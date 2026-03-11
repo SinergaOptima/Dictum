@@ -348,6 +348,8 @@ export default function Home() {
     handleEditAppProfile,
     resetAppProfileEditor,
     handleApplyAppProfilePreset,
+    handleUseCurrentForegroundApp,
+    handleDuplicateAppProfile,
     handleDeleteAppProfile,
     handleCopyAppProfiles,
     handleImportAppProfiles,
@@ -1190,7 +1192,7 @@ export default function Home() {
   const readinessChecklistText = useMemo(
     () =>
       [
-        "Dictum 0.1.8 readiness checklist",
+        "Dictum 0.1.9-dev.1 readiness checklist",
         ...readinessItems.map((item) => `- [${item.ok ? "x" : " "}] ${item.label}: ${item.value} (${item.detail})`),
       ].join("\n"),
     [readinessItems],
@@ -1812,7 +1814,7 @@ export default function Home() {
                       <div className="settings-card-header">
                         <h3>Smoke Benchmark Baseline</h3>
                         <p>
-                          Repo baseline from the committed smoke fixture pack. Use it as a stable reference when tuning `0.1.8`.
+                          Repo baseline from the committed smoke fixture pack. Use it as a stable reference when tuning `0.1.9-dev.1`.
                         </p>
                       </div>
                       <div className="panel-grid">
@@ -2336,6 +2338,8 @@ export default function Home() {
                   onCopy={handleCopyAppProfiles}
                   onImport={handleImportAppProfiles}
                   onEdit={handleEditAppProfile}
+                  onUseCurrentForegroundApp={handleUseCurrentForegroundApp}
+                  onDuplicate={handleDuplicateAppProfile}
                   onDelete={handleDeleteAppProfile}
                   onCancelEdit={resetAppProfileEditor}
                   onApplyPreset={handleApplyAppProfilePreset}

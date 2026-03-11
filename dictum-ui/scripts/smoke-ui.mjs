@@ -105,7 +105,7 @@ async function startManagedServer() {
 function buildInitScript(config) {
   return `
     (() => {
-      const currentVersion = "0.1.8";
+      const currentVersion = "0.1.9-dev.1";
       const state = {
         runtimeSettings: {
           modelProfile: "distil-large-v3",
@@ -439,6 +439,17 @@ async function assertText(page, text) {
   await page.getByText(text, { exact: false }).waitFor({ timeout: 10000 });
 }
 
+async function waitForInputValue(locator, expected, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await locator.inputValue()) === expected) {
+      return;
+    }
+    await sleep(150);
+  }
+  throw new Error(`Expected input value "${expected}", got "${await locator.inputValue()}".`);
+}
+
 async function runOnboardingSmoke(browser) {
   const context = await browser.newContext();
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: baseUrl });
@@ -473,7 +484,7 @@ async function runSettingsAndStatsSmoke(browser) {
   await page.addInitScript(buildInitScript({
     onboardingCompleted: true,
     activeAppContext: {
-      foregroundApp: null,
+      foregroundApp: "notepad.exe",
       matchedProfileId: null,
       matchedProfileName: null,
       dictationMode: "conversation",
@@ -486,6 +497,16 @@ async function runSettingsAndStatsSmoke(browser) {
   await page.getByRole("button", { name: /settings/i }).click();
   await assertText(page, "Per-App Profiles");
   await assertText(page, "Live Corrections");
+  await page.getByRole("button", { name: /use current app/i }).click();
+  await page.getByLabel("App Match").fill("");
+  await page.getByRole("button", { name: /use current app/i }).click();
+  const currentAppMatch = await page.getByLabel("App Match").inputValue();
+  if (currentAppMatch !== "notepad.exe") {
+    throw new Error(`Expected Use Current App to prefill notepad.exe, got ${currentAppMatch || "<empty>"}.`);
+  }
+  await page.getByRole("button", { name: /^duplicate$/i }).first().evaluate((button) => button.click());
+  await waitForInputValue(page.getByLabel("Profile Name"), "Cursor Copy");
+  await waitForInputValue(page.getByLabel("App Match"), "");
 
   const profileScopeButton = page.getByRole("button", { name: /active profile/i });
   if (!(await profileScopeButton.isDisabled())) {

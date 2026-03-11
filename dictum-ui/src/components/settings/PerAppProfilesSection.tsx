@@ -43,6 +43,8 @@ type PerAppProfilesSectionProps = {
   onCopy: () => void | Promise<void>;
   onImport: () => void | Promise<void>;
   onEdit: (profile: AppProfile) => void;
+  onUseCurrentForegroundApp: () => void | Promise<void>;
+  onDuplicate: (profile: AppProfile) => void | Promise<void>;
   onDelete: (id: string, name: string) => void | Promise<void>;
   onCancelEdit: () => void;
   onApplyPreset: (preset: AppProfilePreset) => void;
@@ -73,6 +75,8 @@ export function PerAppProfilesSection({
   onCopy,
   onImport,
   onEdit,
+  onUseCurrentForegroundApp,
+  onDuplicate,
   onDelete,
   onCancelEdit,
   onApplyPreset,
@@ -101,6 +105,18 @@ export function PerAppProfilesSection({
             {preset.name}
           </button>
         ))}
+      </div>
+      <div className="settings-inline-actions">
+        <button className="action-btn secondary" onClick={() => void onUseCurrentForegroundApp()} type="button">
+          {activeAppContext?.matchedProfileName ? "Load Active App" : "Use Current App"}
+        </button>
+        <span className="settings-note">
+          {activeAppContext?.foregroundApp
+            ? activeAppContext?.matchedProfileName
+              ? `Current foreground app is already matched to ${activeAppContext.matchedProfileName}.`
+              : `No saved profile matches ${activeAppContext.foregroundApp} yet.`
+            : "Bring the target app to the foreground, then use it to seed a profile."}
+        </span>
       </div>
       <p className="settings-note">
         Presets fill the editor with a starting mode and vocabulary. You can paste either a full Windows path or an executable name, and Dictum will normalize it to `cursor.exe` or `slack.exe`.
@@ -216,6 +232,9 @@ export function PerAppProfilesSection({
                 <div className="context-menu">
                   <button className="context-action" onClick={() => onEdit(profile)} type="button">
                     Edit
+                  </button>
+                  <button className="context-action" onClick={() => onDuplicate(profile)} type="button">
+                    Duplicate
                   </button>
                   <button
                     className="context-action danger"
