@@ -314,7 +314,7 @@ fn open_clipboard_with_retry(owner: windows_sys::Win32::Foundation::HWND) -> boo
 }
 
 #[cfg(target_os = "windows")]
-fn foreground_process_name() -> Option<String> {
+pub(crate) fn foreground_process_name() -> Option<String> {
     use std::path::Path;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
@@ -353,6 +353,11 @@ fn foreground_process_name() -> Option<String> {
             .to_ascii_lowercase();
         Some(exe)
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn foreground_process_name() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "windows")]

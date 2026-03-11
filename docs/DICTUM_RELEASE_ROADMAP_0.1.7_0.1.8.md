@@ -51,6 +51,16 @@ Make Dictum easier to trust under real use by improving updater reliability, mak
 
 Improve recognition usefulness for real workflows by making dictation behavior context-aware and strengthening correction memory without changing the product's visual identity.
 
+### Dev Cadence
+
+- `0.1.8` will ship through five internal dev builds before the public release:
+  - `0.1.8-dev.1`
+  - `0.1.8-dev.2`
+  - `0.1.8-dev.3`
+  - `0.1.8-dev.4`
+  - `0.1.8-dev.5`
+- Public tagging and GitHub release creation should happen only after `0.1.8-dev.5` passes the release checklist.
+
 ### Scope
 
 - Add per-app profiles:
@@ -84,6 +94,31 @@ Improve recognition usefulness for real workflows by making dictation behavior c
 - Start with additive settings schema fields and a default global profile.
 - Avoid backend swaps in this release unless `v0.1.7` benchmark evidence shows the current stack cannot hit reliability goals.
 - Keep the main page visually consistent, but split implementation into smaller modules to reduce regression risk.
+
+### Current Dev Status
+
+`0.1.8-dev.3` currently includes:
+
+- guided onboarding tuning
+- dictation modes
+- per-app profiles
+- per-app phrase bias and refinement overrides
+- active profile visibility
+- profile import/export
+- learned correction import/export and filtering
+- mode-aware correction suggestions
+- correction health diagnostics
+- prune actions for unused, stale, and orphaned correction rules
+- validation for missing app-profile correction affinity
+
+The remaining public-release work after `dev.3` is:
+
+- diagnostics export visibility for settings-schema health and migration notes
+- stricter duplicate validation for imported app profiles and learned corrections
+- smoke coverage for normalization, duplicate rejection, orphan pruning, and settings-health visibility
+- final stabilization, packaging, and release gating for `dev.4`, `dev.5`, and public `0.1.8`
+
+The next execution plans are documented in `docs/DICTUM_0.1.8_DEV2_DEV4_PLAN.md`.
 
 ## Deferred Until Proven Necessary
 

@@ -32,8 +32,8 @@ use dictum_core::{
 };
 use parking_lot::Mutex;
 use settings::{
-    apply_runtime_env_from_settings, default_settings_path, engine_config_for_settings,
-    load_settings, RuntimeEnvMode,
+    apply_runtime_env_from_settings, apply_runtime_env_with_profile, default_settings_path,
+    engine_config_for_settings, load_settings, resolve_app_profile, save_settings, RuntimeEnvMode,
 };
 use state::{AppState, PerfMetrics};
 use storage::{HistoryRecordInput, LocalStore};
@@ -44,7 +44,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::ShortcutState;
 use tracing::info;
-use transform::TextTransform;
+use transform::{DictationMode, TextTransform};
 
 const DEFAULT_GLOBAL_TOGGLE_SHORTCUT: &str = "Ctrl+Shift+Space";
 const TRAY_SHOW_HIDE_ID: &str = "tray_show_hide";
@@ -168,6 +168,16 @@ fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+fn resolve_dictation_mode_for_app(
+    settings: &settings::AppSettings,
+    foreground_app: Option<&str>,
+) -> DictationMode {
+    if let Some(profile) = resolve_app_profile(settings, foreground_app) {
+        return DictationMode::from_str(&profile.dictation_mode);
+    }
+    DictationMode::from_str(&settings.dictation_mode)
+}
+
 fn setup_system_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let show_hide_item = MenuItem::with_id(
         app,
@@ -237,13 +247,25 @@ fn is_duplicate_transcript(
 fn apply_learned_corrections(
     text: &str,
     corrections: &[settings::LearnedCorrection],
-) -> (String, bool) {
+    dictation_mode: &str,
+    active_profile_id: Option<&str>,
+) -> (String, Vec<AppliedCorrection>) {
     let mut out = text.trim().to_string();
     if out.is_empty() || corrections.is_empty() {
-        return (out, false);
+        return (out, Vec::new());
     }
-    let mut applied = false;
+    let mut applied = Vec::new();
     for correction in corrections {
+        if let Some(mode_affinity) = correction.mode_affinity.as_deref() {
+            if !mode_affinity.eq_ignore_ascii_case(dictation_mode) {
+                continue;
+            }
+        }
+        if let Some(profile_affinity) = correction.app_profile_affinity.as_deref() {
+            if active_profile_id != Some(profile_affinity) {
+                continue;
+            }
+        }
         let heard = correction.heard.trim();
         let corrected = correction.corrected.trim();
         if heard.is_empty() || corrected.is_empty() {
@@ -251,11 +273,65 @@ fn apply_learned_corrections(
         }
         let replaced = replace_word_case_aware_local(&out, heard, corrected);
         if replaced != out {
-            applied = true;
+            applied.push(AppliedCorrection {
+                heard: correction.heard.clone(),
+                corrected: correction.corrected.clone(),
+                mode_affinity: correction.mode_affinity.clone(),
+                app_profile_affinity: correction.app_profile_affinity.clone(),
+            });
             out = replaced;
         }
     }
     (out, applied)
+}
+
+#[derive(Debug, Clone)]
+struct AppliedCorrection {
+    heard: String,
+    corrected: String,
+    mode_affinity: Option<String>,
+    app_profile_affinity: Option<String>,
+}
+
+fn record_applied_correction_usage(
+    settings: &Arc<Mutex<settings::AppSettings>>,
+    learned_corrections: &Arc<parking_lot::RwLock<Vec<settings::LearnedCorrection>>>,
+    settings_path: &std::path::Path,
+    applied: &[AppliedCorrection],
+) {
+    if applied.is_empty() {
+        return;
+    }
+    let used_at = chrono::Utc::now().to_rfc3339();
+    let mut guard = settings.lock();
+    let mut changed = false;
+    for entry in applied {
+        if let Some(existing) = guard.learned_corrections.iter_mut().find(|candidate| {
+            candidate.heard.eq_ignore_ascii_case(&entry.heard)
+                && candidate.corrected.eq_ignore_ascii_case(&entry.corrected)
+                && candidate.mode_affinity == entry.mode_affinity
+                && candidate.app_profile_affinity == entry.app_profile_affinity
+        }) {
+            // Real transcript-time usage should outrank manual setup-only saves.
+            existing.hits = existing.hits.saturating_add(2);
+            existing.last_used_at = Some(used_at.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    guard.learned_corrections.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| a.heard.cmp(&b.heard))
+    });
+    guard.normalize();
+    if let Err(error) = save_settings(settings_path, &guard) {
+        tracing::warn!("failed to persist learned correction usage: {error}");
+    }
+    *learned_corrections.write() = guard.learned_corrections.clone();
 }
 
 fn replace_word_case_aware_local(text: &str, needle: &str, replacement: &str) -> String {
@@ -323,6 +399,82 @@ fn match_case_local(source: &str, replacement: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::apply_learned_corrections;
+    use crate::settings::LearnedCorrection;
+
+    #[test]
+    fn applies_global_correction_without_context_filters() {
+        let corrections = vec![LearnedCorrection {
+            heard: "foo".into(),
+            corrected: "bar".into(),
+            hits: 1,
+            mode_affinity: None,
+            app_profile_affinity: None,
+            last_used_at: None,
+        }];
+
+        let (text, applied) =
+            apply_learned_corrections("foo test", &corrections, "conversation", None);
+
+        assert_eq!(text, "bar test");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            applied[0].heard, "foo",
+            "applied correction should identify the matched rule"
+        );
+    }
+
+    #[test]
+    fn skips_correction_when_mode_affinity_does_not_match() {
+        let corrections = vec![LearnedCorrection {
+            heard: "printf".into(),
+            corrected: "println!".into(),
+            hits: 3,
+            mode_affinity: Some("coding".into()),
+            app_profile_affinity: None,
+            last_used_at: None,
+        }];
+
+        let (text, applied) =
+            apply_learned_corrections("printf ready", &corrections, "conversation", None);
+
+        assert_eq!(text, "printf ready");
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn applies_profile_specific_correction_only_for_matching_profile() {
+        let corrections = vec![LearnedCorrection {
+            heard: "ship it".into(),
+            corrected: "ShipIt".into(),
+            hits: 5,
+            mode_affinity: Some("command".into()),
+            app_profile_affinity: Some("slack-profile".into()),
+            last_used_at: None,
+        }];
+
+        let (text, applied) = apply_learned_corrections(
+            "ship it now",
+            &corrections,
+            "command",
+            Some("slack-profile"),
+        );
+        assert_eq!(text, "ShipIt now");
+        assert_eq!(applied.len(), 1);
+
+        let (text_miss, applied_miss) = apply_learned_corrections(
+            "ship it now",
+            &corrections,
+            "command",
+            Some("cursor-profile"),
+        );
+        assert_eq!(text_miss, "ship it now");
+        assert!(applied_miss.is_empty());
+    }
+}
+
 fn main() {
     // ── Tracing ───────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
@@ -340,6 +492,18 @@ fn main() {
 
     let settings_path = default_settings_path();
     let app_settings = load_settings(&settings_path);
+    if app_settings.needs_persist_after_load() {
+        if let Err(error) = save_settings(&settings_path, &app_settings) {
+            tracing::warn!("failed to persist normalized settings on startup: {error}");
+        } else {
+            info!(
+                loaded_schema_version = app_settings.loaded_schema_version,
+                current_schema_version = settings::CURRENT_SETTINGS_SCHEMA_VERSION,
+                migration_notes = ?app_settings.migration_notes,
+                "persisted normalized settings on startup"
+            );
+        }
+    }
     apply_runtime_env_from_settings(&app_settings, RuntimeEnvMode::FillMissing);
     info!(
         settings_path = ?settings_path,
@@ -446,6 +610,7 @@ fn main() {
     let store_for_setup = Arc::clone(&store);
     let transformer_for_setup = Arc::clone(&transformer);
     let settings_for_setup = Arc::clone(&settings_state);
+    let settings_path_for_setup = settings_path.clone();
     let learned_corrections_for_setup = Arc::new(parking_lot::RwLock::new(
         app_settings.learned_corrections.clone(),
     ));
@@ -477,6 +642,7 @@ fn main() {
             let store_clone = Arc::clone(&store_for_setup);
             let transformer_clone = Arc::clone(&transformer_for_setup);
             let settings_clone = Arc::clone(&settings_for_setup);
+            let settings_path_clone = settings_path_for_setup.clone();
             let learned_corrections_clone = Arc::clone(&learned_corrections_for_loop);
             let perf_metrics_clone = Arc::clone(&perf_metrics_for_setup);
             let mut last_injected_text: Option<(String, Instant)> = None;
@@ -501,25 +667,50 @@ fn main() {
                             let mut final_text_parts = Vec::new();
                             let mut dictionary_applied = false;
                             let mut snippet_applied = false;
+                            let mut applied_corrections = Vec::new();
                             let corrections_snapshot = learned_corrections_clone.read().clone();
+                            let active_app = text_injector::foreground_process_name();
+                            let (dictation_mode, active_profile_id) = {
+                                let settings_guard = settings_clone.lock();
+                                let active_profile =
+                                    resolve_app_profile(&settings_guard, active_app.as_deref());
+                                (
+                                    resolve_dictation_mode_for_app(
+                                        &settings_guard,
+                                        active_app.as_deref(),
+                                    ),
+                                    active_profile.map(|profile| profile.id.clone()),
+                                )
+                            };
                             let transform_started = Instant::now();
                             for segment in event
                                 .segments
                                 .iter_mut()
                                 .filter(|segment| segment.kind == SegmentKind::Final)
                             {
-                                let (corrected_text, correction_applied) = apply_learned_corrections(
+                                let (corrected_text, matched_corrections) = apply_learned_corrections(
                                     segment.text.trim(),
                                     &corrections_snapshot,
+                                    dictation_mode.as_str(),
+                                    active_profile_id.as_deref(),
                                 );
-                                let transformed = transformer_clone.apply(corrected_text.trim());
+                                let transformed =
+                                    transformer_clone.apply(corrected_text.trim(), dictation_mode);
                                 if !transformed.text.is_empty() {
                                     segment.text = transformed.text.clone();
                                     final_text_parts.push(transformed.text);
                                 }
-                                dictionary_applied |= transformed.dictionary_applied || correction_applied;
+                                dictionary_applied |=
+                                    transformed.dictionary_applied || !matched_corrections.is_empty();
                                 snippet_applied |= transformed.snippet_applied;
+                                applied_corrections.extend(matched_corrections);
                             }
+                            record_applied_correction_usage(
+                                &settings_clone,
+                                &learned_corrections_clone,
+                                &settings_path_clone,
+                                &applied_corrections,
+                            );
                             let transform_elapsed_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
                             perf_metrics_clone
                                 .lock()
@@ -701,6 +892,47 @@ fn main() {
                 }
             });
 
+            let settings_for_profile_watcher = Arc::clone(&settings_for_setup);
+            tauri::async_runtime::spawn(async move {
+                let mut last_profile_key = String::new();
+                loop {
+                    let active_app = text_injector::foreground_process_name();
+                    let profile_key = {
+                        let settings_guard = settings_for_profile_watcher.lock();
+                        let matched_profile =
+                            resolve_app_profile(&settings_guard, active_app.as_deref());
+                        let profile_key = matched_profile
+                            .map(|profile| {
+                                format!(
+                                    "{}|{}|{}|{}",
+                                    profile.id,
+                                    profile.dictation_mode,
+                                    profile.post_utterance_refine,
+                                    profile.phrase_bias_terms.join("\n")
+                                )
+                            })
+                            .unwrap_or_else(|| "base".to_string());
+                        if profile_key != last_profile_key {
+                            apply_runtime_env_with_profile(
+                                &settings_guard,
+                                matched_profile,
+                                RuntimeEnvMode::Overwrite,
+                            );
+                            tracing::debug!(
+                                active_app = active_app.as_deref().unwrap_or(""),
+                                profile = profile_key,
+                                "applied runtime env for active app profile"
+                            );
+                        }
+                        profile_key
+                    };
+                    if profile_key != last_profile_key {
+                        last_profile_key = profile_key;
+                    }
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                }
+            });
+
             ensure_pill_window(&app_handle)?;
 
             Ok(())
@@ -741,9 +973,15 @@ fn main() {
             commands::set_runtime_settings,
             commands::get_learned_corrections,
             commands::learn_correction,
+            commands::prune_learned_corrections,
             commands::delete_learned_correction,
+            commands::get_app_profiles,
+            commands::upsert_app_profile,
+            commands::delete_app_profile,
+            commands::get_active_app_context,
             commands::get_perf_snapshot,
             commands::get_diagnostics_bundle,
+            commands::export_diagnostics_bundle,
             commands::get_privacy_settings,
             commands::set_privacy_settings,
             commands::get_history,

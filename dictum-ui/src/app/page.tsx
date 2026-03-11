@@ -2,69 +2,48 @@
 
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useActivity } from "@/hooks/useActivity";
+import { useAppProfiles } from "@/hooks/useAppProfiles";
 import { useAudioDevices } from "@/hooks/useAudioDevices";
+import { useCorrectionsManager } from "@/hooks/useCorrectionsManager";
 import { useEngine } from "@/hooks/useEngine";
+import { useGuidedTune } from "@/hooks/useGuidedTune";
+import { usePanelData } from "@/hooks/usePanelData";
+import { useUpdateManager } from "@/hooks/useUpdateManager";
 import { useTranscript } from "@/hooks/useTranscript";
+import { AppUpdatesSection } from "@/components/settings/AppUpdatesSection";
+import { LiveCorrectionsSection } from "@/components/settings/LiveCorrectionsSection";
+import { OnboardingModal } from "@/components/settings/OnboardingModal";
+import { PerAppProfilesSection } from "@/components/settings/PerAppProfilesSection";
+import { PrivacySection } from "@/components/settings/PrivacySection";
 import type {
-  AppUpdateInfo,
-  DictionaryEntry,
-  HistoryItem,
-  LearnedCorrection,
+  DiagnosticsBundle,
   ModelProfileMetadata,
   ModelProfileRecommendation,
-  PerfSnapshot,
   PrivacySettings,
-  SnippetEntry,
-  StatsPayload,
 } from "@shared/ipc_types";
 import {
-  deleteLearnedCorrection,
   deleteDictionary,
   deleteHistory,
   deleteSnippet,
-  getDictionary,
   getDiagnosticsBundle,
-  getHistory,
-  getLearnedCorrections,
+  exportDiagnosticsBundle,
   getModelProfileCatalog,
   getModelProfileRecommendation,
-  getPerfSnapshot,
   getPreferredInputDevice,
   getPrivacySettings,
-  getAppVersion,
   getRuntimeSettings,
-  getSnippets,
-  getStats,
-  learnCorrection,
   runAutoTune,
-  runBenchmarkAutoTune,
-  checkForAppUpdate,
-  downloadAndInstallAppUpdate,
   setPreferredInputDevice,
   setRuntimeSettings,
   upsertDictionary,
   upsertSnippet,
 } from "@/lib/tauri";
 import { motion, AnimatePresence } from "framer-motion";
+import { smokeBaseline } from "@/data/smokeBaseline";
 
 type Tab = "live" | "history" | "stats" | "dictionary" | "snippets" | "settings";
 type CloudMode = "local_only" | "hybrid" | "cloud_preferred";
-type UpdateCheckOptions = {
-  silent?: boolean;
-  ignoreDeferrals?: boolean;
-  source?: "manual" | "startup-auto";
-};
-type UpdateInstallOptions = {
-  autoExit?: boolean;
-  source?: "manual" | "banner" | "idle-auto";
-};
-type UpdateTelemetryEvent = {
-  id: string;
-  at: string;
-  event: string;
-  detail: string;
-  source: "manual" | "startup-auto" | "idle-auto" | "system";
-};
+type DictationMode = "conversation" | "coding" | "command";
 
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -76,6 +55,9 @@ function isEditableTarget(target: EventTarget | null): boolean {
     tag === "SELECT"
   );
 }
+
+const formatPct = (value: number | null | undefined): string =>
+  value == null ? "n/a" : `${Math.round(value * 100)}%`;
 
 const MODEL_PROFILE_OPTIONS = [
   { value: "distil-large-v3", label: "Distil Large v3 (recommended)" },
@@ -129,44 +111,7 @@ const CLOUD_MODE_OPTIONS: Array<{ value: CloudMode; label: string; hint: string 
   },
 ];
 
-const MIC_CALIBRATION_STORAGE_KEY = "dictum-mic-calibration-v1";
-const UPDATE_REPO_STORAGE_KEY = "dictum-update-repo-v1";
-const DEFAULT_UPDATE_REPO = "sinergaoptima/dictum";
-const LEGACY_UPDATE_REPOS = new Set(["latticelabs/dictum"]);
-const UPDATE_AUTO_CHECK_STORAGE_KEY = "dictum-update-auto-check-v1";
-const UPDATE_SKIP_VERSION_STORAGE_KEY = "dictum-update-skip-version-v1";
-const UPDATE_REMIND_UNTIL_STORAGE_KEY = "dictum-update-remind-until-v1";
-const UPDATE_LAST_CHECKED_STORAGE_KEY = "dictum-update-last-checked-v1";
-const UPDATE_AUTO_INSTALL_IDLE_STORAGE_KEY = "dictum-update-auto-install-idle-v1";
-const UPDATE_TELEMETRY_STORAGE_KEY = "dictum-update-telemetry-v1";
-const UPDATE_IDLE_INSTALL_GRACE_MS = 120_000;
-const PANEL_CACHE_TTL_MS = 30_000;
-const HISTORY_SEARCH_DEBOUNCE_MS = 180;
 const TAB_OPTIONS: Tab[] = ["live", "history", "stats", "dictionary", "snippets", "settings"];
-
-type PanelLoadingState = {
-  history: boolean;
-  stats: boolean;
-  dictionary: boolean;
-  snippets: boolean;
-};
-
-type MicCalibration = {
-  pillVisualizerSensitivity: number;
-  activitySensitivity: number;
-  activityNoiseGate: number;
-  activityClipThreshold: number;
-  inputGainBoost: number;
-};
-
-const clamp = (v: number, min: number, max: number): number => Math.min(max, Math.max(min, v));
-
-const percentile = (samples: number[], p: number): number => {
-  if (samples.length === 0) return 0;
-  const sorted = [...samples].sort((a, b) => a - b);
-  const idx = Math.floor((sorted.length - 1) * clamp(p, 0, 1));
-  return sorted[idx] ?? 0;
-};
 
 const normalizeWords = (text: string): string[] =>
   text.toLowerCase().match(/[a-z0-9']+/g) ?? [];
@@ -185,11 +130,124 @@ const jaccardSimilarity = (a: string, b: string): number => {
   return union <= 0 ? 0 : intersection / union;
 };
 
+const inferCorrectionModeAffinity = (corrected: string, mode: DictationMode): number => {
+  const text = corrected.trim();
+  if (!text) return 0;
+  const hasCodeSymbols = /[_/\\()[\]{}:=;`."'-]/.test(text);
+  const hasCamelOrPascal = /[a-z][A-Z]|[A-Z][a-z]+[A-Z]/.test(text);
+  const hasDashOrSlash = /[-/]/.test(text);
+  const isMostlyLower = text === text.toLowerCase();
+  const hasSpaces = /\s/.test(text);
+
+  switch (mode) {
+    case "coding":
+      return (
+        (hasCodeSymbols ? 0.55 : 0) +
+        (hasCamelOrPascal ? 0.28 : 0) +
+        (!hasSpaces ? 0.12 : 0)
+      );
+    case "command":
+      return (
+        (hasDashOrSlash ? 0.45 : 0) +
+        (isMostlyLower ? 0.24 : 0) +
+        (!hasSpaces ? 0.12 : 0)
+      );
+    default:
+      return (
+        (hasSpaces ? 0.2 : 0) +
+        (!hasCodeSymbols ? 0.14 : 0) +
+        (/^[A-Z]/.test(text) ? 0.08 : 0)
+      );
+  }
+};
+
+const matchesCorrectionContext = (
+  rule: {
+    modeAffinity?: string | null;
+    appProfileAffinity?: string | null;
+  },
+  activeProfileId: string | null,
+  activeMode: DictationMode,
+): boolean => {
+  if (rule.appProfileAffinity) {
+    return rule.appProfileAffinity === activeProfileId;
+  }
+  if (rule.modeAffinity) {
+    return rule.modeAffinity === activeMode;
+  }
+  return true;
+};
+
+const DICTATION_MODE_OPTIONS: Array<{ value: DictationMode; label: string; hint: string }> = [
+  {
+    value: "conversation",
+    label: "Conversation",
+    hint: "Sentence-style cleanup for natural prose and messages.",
+  },
+  {
+    value: "coding",
+    label: "Coding",
+    hint: "Maps common spoken symbol phrases and avoids sentence punctuation.",
+  },
+  {
+    value: "command",
+    label: "Command",
+    hint: "Lowercases commands, trims punctuation, and favors shell-style text.",
+  },
+];
+
+const toggleUniqueMode = (modes: DictationMode[], mode: DictationMode): DictationMode[] =>
+  modes.includes(mode) ? modes.filter((entry) => entry !== mode) : [...modes, mode];
+
+const APP_PROFILE_PRESETS: Array<{
+  name: string;
+  appMatch: string;
+  dictationMode: DictationMode;
+  phraseBiasTerms: string[];
+  postUtteranceRefine: boolean;
+}> = [
+  {
+    name: "Cursor",
+    appMatch: "cursor.exe",
+    dictationMode: "coding",
+    phraseBiasTerms: ["TypeScript", "React", "PostgreSQL"],
+    postUtteranceRefine: true,
+  },
+  {
+    name: "VS Code",
+    appMatch: "code.exe",
+    dictationMode: "coding",
+    phraseBiasTerms: ["TypeScript", "JavaScript", "terminal"],
+    postUtteranceRefine: true,
+  },
+  {
+    name: "Windows Terminal",
+    appMatch: "windowsterminal.exe",
+    dictationMode: "command",
+    phraseBiasTerms: ["PowerShell", "git", "npm"],
+    postUtteranceRefine: false,
+  },
+  {
+    name: "Slack",
+    appMatch: "slack.exe",
+    dictationMode: "conversation",
+    phraseBiasTerms: ["Dictum", "follow-up", "standup"],
+    postUtteranceRefine: true,
+  },
+];
+
+const clamp = (v: number, min: number, max: number): number => Math.min(max, Math.max(min, v));
+
 export default function Home() {
   const { isListening, status, startEngine, stopEngine, error } = useEngine();
   const [activitySensitivity, setActivitySensitivity] = useState(4.2);
   const [activityNoiseGate, setActivityNoiseGate] = useState(0.0015);
   const [activityClipThreshold, setActivityClipThreshold] = useState(0.32);
+  const [diagnosticsBundle, setDiagnosticsBundle] = useState<DiagnosticsBundle | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [diagnosticsExporting, setDiagnosticsExporting] = useState(false);
+  const [lastDiagnosticsExportPath, setLastDiagnosticsExportPath] = useState<string | null>(null);
+  const [readinessChecklistCopied, setReadinessChecklistCopied] = useState<"idle" | "done" | "error">("idle");
   const { isSpeech, level, rawRms, isNoisy, isClipping } = useActivity({
     sensitivity: activitySensitivity,
     noiseGate: activityNoiseGate,
@@ -203,9 +261,6 @@ export default function Home() {
   const latestRmsRef = useRef(0);
   const manualDeviceSelectionRef = useRef(false);
   const manualModelSelectionRef = useRef(false);
-  const autoUpdateCheckedRef = useRef(false);
-  const lastUserInteractionAtRef = useRef(Date.now());
-  const autoInstallAttemptedForVersionRef = useRef<string | null>(null);
 
   const [tab, setTab] = useState<Tab>("live");
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
@@ -213,6 +268,7 @@ export default function Home() {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [modelProfile, setModelProfile] = useState("distil-large-v3");
   const [performanceProfile, setPerformanceProfile] = useState("whisper_balanced_english");
+  const [dictationMode, setDictationMode] = useState<DictationMode>("conversation");
   const [toggleShortcut, setToggleShortcut] = useState("Ctrl+Shift+Space");
   const [ortEp, setOrtEp] = useState("auto");
   const [ortIntraThreads, setOrtIntraThreads] = useState(0);
@@ -234,55 +290,112 @@ export default function Home() {
   const [retentionDays, setRetentionDays] = useState(90);
   const [runtimeMsg, setRuntimeMsg] = useState<string | null>(null);
   const [calibrationMsg, setCalibrationMsg] = useState<string | null>(null);
-  const [isCalibrating, setIsCalibrating] = useState(false);
-  const [isBenchmarkTuning, setIsBenchmarkTuning] = useState(false);
-  const [updateRepoSlug, setUpdateRepoSlug] = useState(DEFAULT_UPDATE_REPO);
-  const [currentAppVersion, setCurrentAppVersion] = useState<string>("dev");
-  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
-  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
-  const [updateAutoCheckEnabled, setUpdateAutoCheckEnabled] = useState(true);
-  const [updateSkipVersion, setUpdateSkipVersion] = useState<string | null>(null);
-  const [updateRemindUntilMs, setUpdateRemindUntilMs] = useState(0);
-  const [updateLastCheckedAt, setUpdateLastCheckedAt] = useState<string | null>(null);
-  const [updateAutoInstallWhenIdle, setUpdateAutoInstallWhenIdle] = useState(false);
-  const [updateTelemetry, setUpdateTelemetry] = useState<UpdateTelemetryEvent[]>([]);
-  const [updateLogCopied, setUpdateLogCopied] = useState<"idle" | "done" | "error">("idle");
   const [activeFixSegmentId, setActiveFixSegmentId] = useState<string | null>(null);
   const [activeFixText, setActiveFixText] = useState("");
 
-  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [historyQuery, setHistoryQuery] = useState("");
-  const [stats, setStats] = useState<StatsPayload | null>(null);
-  const [perfSnapshot, setPerfSnapshot] = useState<PerfSnapshot | null>(null);
-  const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
-  const [snippets, setSnippets] = useState<SnippetEntry[]>([]);
-  const [panelLoading, setPanelLoading] = useState<PanelLoadingState>({
-    history: false,
-    stats: false,
-    dictionary: false,
-    snippets: false,
-  });
   const [modelCatalog, setModelCatalog] = useState<ModelProfileMetadata[]>([]);
   const [modelRecommendation, setModelRecommendation] = useState<ModelProfileRecommendation | null>(null);
-  const [learnedCorrections, setLearnedCorrections] = useState<LearnedCorrection[]>([]);
-  const [correctionHeardInput, setCorrectionHeardInput] = useState("");
-  const [correctionFixedInput, setCorrectionFixedInput] = useState("");
   const [dictTerm, setDictTerm] = useState("");
   const [dictAliases, setDictAliases] = useState("");
   const [dictLanguage, setDictLanguage] = useState("");
   const [snippetTrigger, setSnippetTrigger] = useState("");
   const [snippetExpansion, setSnippetExpansion] = useState("");
   const [snippetMode, setSnippetMode] = useState<"slash" | "phrase">("slash");
-  const panelLoadedAtRef = useRef<Record<keyof PanelLoadingState, number>>({
-    history: 0,
-    stats: 0,
-    dictionary: 0,
-    snippets: 0,
-  });
+  const [snippetApplyModes, setSnippetApplyModes] = useState<DictationMode[]>([]);
   const deferredSegments = useDeferredValue(segments);
-  const deferredHistoryQuery = useDeferredValue(historyQuery.trim());
-
+  const {
+    currentAppVersion,
+    updateRepoSlug,
+    setUpdateRepoSlug,
+    updateInfo,
+    isCheckingUpdate,
+    isInstallingUpdate,
+    updateAutoCheckEnabled,
+    setUpdateAutoCheckEnabled,
+    updateSkipVersion,
+    updateRemindUntilMs,
+    updateLastCheckedAt,
+    updateAutoInstallWhenIdle,
+    setUpdateAutoInstallWhenIdle,
+    updateTelemetry,
+    updateLogCopied,
+    handleCheckForUpdates,
+    handleInstallUpdate,
+    handleRemindLater,
+    handleSkipUpdateVersion,
+    clearUpdateDeferrals,
+    handleExportUpdateTelemetry,
+  } = useUpdateManager({
+    isListening,
+    showOnboarding,
+    setRuntimeMsg,
+  });
+  const {
+    appProfiles,
+    activeAppContext,
+    editingAppProfileId,
+    appProfileName,
+    setAppProfileName,
+    appProfileMatch,
+    setAppProfileMatch,
+    appProfileMode,
+    setAppProfileMode,
+    appProfileBiasTerms,
+    setAppProfileBiasTerms,
+    appProfileRefine,
+    setAppProfileRefine,
+    appProfilesCopied,
+    appProfilesImportText,
+    setAppProfilesImportText,
+    handleSaveAppProfile,
+    handleEditAppProfile,
+    resetAppProfileEditor,
+    handleApplyAppProfilePreset,
+    handleUseCurrentForegroundApp,
+    handleDuplicateAppProfile,
+    handleDeleteAppProfile,
+    handleCopyAppProfiles,
+    handleImportAppProfiles,
+  } = useAppProfiles({
+    tab,
+    setRuntimeMsg,
+  });
+  const {
+    learnedCorrections,
+    correctionsCopied,
+    correctionsImportText,
+    setCorrectionsImportText,
+    correctionFilter,
+    setCorrectionFilter,
+    correctionHeardInput,
+    setCorrectionHeardInput,
+    correctionFixedInput,
+    setCorrectionFixedInput,
+    correctionScope,
+    setCorrectionScope,
+    correctionFilterScope,
+    setCorrectionFilterScope,
+    correctionSort,
+    setCorrectionSort,
+    activeCorrectionContext,
+    correctionHealthSummary,
+    filteredLearnedCorrections,
+    editingCorrection,
+    applyCorrection,
+    handleLearnCorrection,
+    handleDeleteCorrection,
+    handleStartEditingCorrection,
+    handleCancelEditingCorrection,
+    handleCopyCorrections,
+    handleImportCorrections,
+    handlePruneCorrections,
+  } = useCorrectionsManager({
+    setRuntimeMsg,
+    activeAppContext,
+    currentDictationMode: dictationMode,
+    appProfiles,
+  });
   const copyText = useMemo(() => {
     const finals = segments.filter((seg) => seg.kind === "final");
     const source = finals.length > 0 ? finals : segments;
@@ -304,6 +417,7 @@ export default function Home() {
         .slice(-6),
     [deferredSegments],
   );
+  const effectiveSuggestionMode = ((activeAppContext?.dictationMode || dictationMode) as DictationMode);
   const correctionSuggestions = useMemo(() => {
     const suggestions: Array<{
       id: string;
@@ -311,13 +425,28 @@ export default function Home() {
       corrected: string;
       confidence: number;
       score: number;
+      scopeLabel: string;
+      usageLabel: string;
+      lastUsedAt: string | null;
+      sourceModeAffinity: string | null;
+      sourceAppProfileAffinity: string | null;
     }> = [];
     for (const seg of lowConfidenceFinals) {
       const segConf = seg.confidence ?? 0.6;
       for (const rule of learnedCorrections) {
         const sim = jaccardSimilarity(seg.text, rule.heard);
         const contains = seg.text.toLowerCase().includes(rule.heard.toLowerCase()) ? 1 : 0;
-        const weighted = (1 - segConf) * (1 + Math.min(rule.hits, 12) / 12) * (sim + contains * 0.4);
+        const modeAffinity = inferCorrectionModeAffinity(rule.corrected, effectiveSuggestionMode);
+        const recencyBoost = rule.lastUsedAt
+          ? Math.max(0, 0.18 - ((Date.now() - new Date(rule.lastUsedAt).getTime()) / (1000 * 60 * 60 * 24 * 30)) * 0.18)
+          : 0;
+        const contextBoost =
+          (!rule.modeAffinity || rule.modeAffinity === effectiveSuggestionMode ? 0.24 : -0.18) +
+          (!rule.appProfileAffinity || rule.appProfileAffinity === activeAppContext?.matchedProfileId ? 0.34 : -0.32);
+        const weighted =
+          (1 - segConf) *
+          (1 + Math.min(rule.hits, 12) / 12) *
+          (sim + contains * 0.4 + modeAffinity + contextBoost + recencyBoost);
         if (weighted < 0.18) continue;
         suggestions.push({
           id: `${seg.id}:${rule.heard}:${rule.corrected}`,
@@ -325,30 +454,19 @@ export default function Home() {
           corrected: rule.corrected,
           confidence: segConf,
           score: weighted,
+          scopeLabel: rule.appProfileAffinity
+            ? appProfiles.find((profile) => profile.id === rule.appProfileAffinity)?.name || "profile"
+            : rule.modeAffinity || "global",
+          usageLabel: `hits ${rule.hits}`,
+          lastUsedAt: rule.lastUsedAt ?? null,
+          sourceModeAffinity: rule.modeAffinity ?? null,
+          sourceAppProfileAffinity: rule.appProfileAffinity ?? null,
         });
       }
     }
     suggestions.sort((a, b) => b.score - a.score);
-    return suggestions.slice(0, 5);
-  }, [learnedCorrections, lowConfidenceFinals]);
-
-  const appendUpdateTelemetry = useCallback((
-    event: string,
-    detail: string,
-    source: UpdateTelemetryEvent["source"] = "system",
-  ) => {
-    setUpdateTelemetry((prev) => {
-      const entry: UpdateTelemetryEvent = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        at: new Date().toISOString(),
-        event,
-        detail,
-        source,
-      };
-      return [entry, ...prev].slice(0, 80);
-    });
-  }, []);
-
+    return suggestions.filter((item, index, arr) => arr.findIndex((other) => other.corrected === item.corrected) === index).slice(0, 5);
+  }, [activeAppContext?.matchedProfileId, appProfiles, effectiveSuggestionMode, learnedCorrections, lowConfidenceFinals]);
   useEffect(() => {
     if (feedRef.current) {
       feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -364,125 +482,6 @@ export default function Home() {
       .then((name) => setSelectedDeviceName(name))
       .catch((err) => console.warn("Could not fetch preferred input device:", err));
   }, []);
-
-  useEffect(() => {
-    getAppVersion()
-      .then((version) => setCurrentAppVersion(version))
-      .catch(() => setCurrentAppVersion("dev"));
-  }, []);
-
-  useEffect(() => {
-    try {
-      const savedRepo = localStorage.getItem(UPDATE_REPO_STORAGE_KEY);
-      if (savedRepo && savedRepo.trim()) {
-        const normalizedRepo = savedRepo.trim().toLowerCase();
-        setUpdateRepoSlug(
-          LEGACY_UPDATE_REPOS.has(normalizedRepo) ? DEFAULT_UPDATE_REPO : savedRepo.trim(),
-        );
-      }
-      const savedAutoCheck = localStorage.getItem(UPDATE_AUTO_CHECK_STORAGE_KEY);
-      if (savedAutoCheck === "0") {
-        setUpdateAutoCheckEnabled(false);
-      } else if (savedAutoCheck === "1") {
-        setUpdateAutoCheckEnabled(true);
-      }
-      const savedSkipVersion = localStorage.getItem(UPDATE_SKIP_VERSION_STORAGE_KEY);
-      if (savedSkipVersion && savedSkipVersion.trim()) {
-        setUpdateSkipVersion(savedSkipVersion.trim());
-      }
-      const savedRemindUntil = Number(localStorage.getItem(UPDATE_REMIND_UNTIL_STORAGE_KEY) || "0");
-      if (Number.isFinite(savedRemindUntil) && savedRemindUntil > 0) {
-        setUpdateRemindUntilMs(savedRemindUntil);
-      }
-      const savedLastChecked = localStorage.getItem(UPDATE_LAST_CHECKED_STORAGE_KEY);
-      if (savedLastChecked && savedLastChecked.trim()) {
-        setUpdateLastCheckedAt(savedLastChecked.trim());
-      }
-      const savedAutoInstallIdle = localStorage.getItem(UPDATE_AUTO_INSTALL_IDLE_STORAGE_KEY);
-      if (savedAutoInstallIdle === "1") {
-        setUpdateAutoInstallWhenIdle(true);
-      } else if (savedAutoInstallIdle === "0") {
-        setUpdateAutoInstallWhenIdle(false);
-      }
-      const savedTelemetry = localStorage.getItem(UPDATE_TELEMETRY_STORAGE_KEY);
-      if (savedTelemetry) {
-        const parsed = JSON.parse(savedTelemetry) as UpdateTelemetryEvent[];
-        if (Array.isArray(parsed)) {
-          setUpdateTelemetry(parsed.slice(0, 80));
-        }
-      }
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(UPDATE_REPO_STORAGE_KEY, updateRepoSlug.trim() || DEFAULT_UPDATE_REPO);
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateRepoSlug]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(UPDATE_AUTO_CHECK_STORAGE_KEY, updateAutoCheckEnabled ? "1" : "0");
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateAutoCheckEnabled]);
-
-  useEffect(() => {
-    try {
-      if (updateSkipVersion && updateSkipVersion.trim()) {
-        localStorage.setItem(UPDATE_SKIP_VERSION_STORAGE_KEY, updateSkipVersion.trim());
-      } else {
-        localStorage.removeItem(UPDATE_SKIP_VERSION_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateSkipVersion]);
-
-  useEffect(() => {
-    try {
-      if (updateRemindUntilMs > 0) {
-        localStorage.setItem(UPDATE_REMIND_UNTIL_STORAGE_KEY, String(Math.floor(updateRemindUntilMs)));
-      } else {
-        localStorage.removeItem(UPDATE_REMIND_UNTIL_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateRemindUntilMs]);
-
-  useEffect(() => {
-    try {
-      if (updateLastCheckedAt && updateLastCheckedAt.trim()) {
-        localStorage.setItem(UPDATE_LAST_CHECKED_STORAGE_KEY, updateLastCheckedAt);
-      } else {
-        localStorage.removeItem(UPDATE_LAST_CHECKED_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateLastCheckedAt]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(UPDATE_AUTO_INSTALL_IDLE_STORAGE_KEY, updateAutoInstallWhenIdle ? "1" : "0");
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateAutoInstallWhenIdle]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(UPDATE_TELEMETRY_STORAGE_KEY, JSON.stringify(updateTelemetry.slice(0, 80)));
-    } catch {
-      // Ignore local storage failures.
-    }
-  }, [updateTelemetry]);
 
   useEffect(() => {
     try {
@@ -507,6 +506,7 @@ export default function Home() {
       .then(([runtime, privacy]) => {
         setModelProfile(runtime.modelProfile || "distil-large-v3");
         setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
+        setDictationMode((runtime.dictationMode || "conversation") as DictationMode);
         setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(runtime.ortEp || "auto");
         setOrtIntraThreads(runtime.ortIntraThreads ?? 0);
@@ -541,12 +541,6 @@ export default function Home() {
         setModelRecommendation(recommendation);
       })
       .catch((err) => console.warn("Could not fetch model profile metadata:", err));
-  }, []);
-
-  useEffect(() => {
-    getLearnedCorrections()
-      .then((rules) => setLearnedCorrections(rules))
-      .catch((err) => console.warn("Could not fetch learned corrections:", err));
   }, []);
 
   useEffect(() => {
@@ -602,55 +596,10 @@ export default function Home() {
   }, [defaultDevice, devices, recommendedDevice, selectedDeviceName]);
 
   useEffect(() => {
-    if (!selectedDeviceName) return;
-    try {
-      const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
-      if (!raw) return;
-      const all = JSON.parse(raw) as Record<string, MicCalibration>;
-      const profile = all[selectedDeviceName];
-      if (!profile) return;
-      setPillVisualizerSensitivity(profile.pillVisualizerSensitivity);
-      setActivitySensitivity(profile.activitySensitivity);
-      setActivityNoiseGate(profile.activityNoiseGate);
-      setActivityClipThreshold(profile.activityClipThreshold);
-      setInputGainBoost(profile.inputGainBoost);
-      void applyRuntime({
-        pillVisualizerSensitivity: profile.pillVisualizerSensitivity,
-        activitySensitivity: profile.activitySensitivity,
-        activityNoiseGate: profile.activityNoiseGate,
-        activityClipThreshold: profile.activityClipThreshold,
-        inputGainBoost: profile.inputGainBoost,
-      });
-    } catch {
-      // Ignore malformed local calibration cache.
-    }
-  }, [selectedDeviceName]);
-
-  useEffect(() => {
     if (copyState === "idle") return;
     const timer = window.setTimeout(() => setCopyState("idle"), 1400);
     return () => window.clearTimeout(timer);
   }, [copyState]);
-
-  useEffect(() => {
-    if (updateLogCopied === "idle") return;
-    const timer = window.setTimeout(() => setUpdateLogCopied("idle"), 1600);
-    return () => window.clearTimeout(timer);
-  }, [updateLogCopied]);
-
-  useEffect(() => {
-    const markInteraction = () => {
-      lastUserInteractionAtRef.current = Date.now();
-    };
-    window.addEventListener("pointerdown", markInteraction, { passive: true });
-    window.addEventListener("keydown", markInteraction);
-    window.addEventListener("wheel", markInteraction, { passive: true });
-    return () => {
-      window.removeEventListener("pointerdown", markInteraction);
-      window.removeEventListener("keydown", markInteraction);
-      window.removeEventListener("wheel", markInteraction);
-    };
-  }, []);
 
   const handleModelProfileChange = useCallback((next: string) => {
     manualModelSelectionRef.current = true;
@@ -698,158 +647,38 @@ export default function Home() {
     }
   }, []);
 
-  const handleCheckForUpdates = useCallback(async (options?: UpdateCheckOptions) => {
-    if (isCheckingUpdate) return;
-    const silent = options?.silent ?? false;
-    const ignoreDeferrals = options?.ignoreDeferrals ?? false;
-    const source = options?.source ?? "manual";
-    setIsCheckingUpdate(true);
-    appendUpdateTelemetry(
-      "check.started",
-      `Checking ${updateRepoSlug.trim() || DEFAULT_UPDATE_REPO}`,
-      source === "startup-auto" ? "startup-auto" : "manual",
-    );
+  const refreshDiagnostics = useCallback(async (showErrors = false) => {
     try {
-      const info = await checkForAppUpdate(updateRepoSlug.trim() || DEFAULT_UPDATE_REPO);
-      setUpdateInfo(info);
-      setUpdateLastCheckedAt(new Date().toISOString());
-      const now = Date.now();
-      const skipped = !!updateSkipVersion && updateSkipVersion === info.latestVersion;
-      const snoozed = updateRemindUntilMs > now;
-      appendUpdateTelemetry(
-        "check.completed",
-        info.hasUpdate
-          ? `Update ${info.currentVersion} -> ${info.latestVersion}${info.assetDownloadUrl ? " (installer found)" : " (no installer asset)"}${info.expectedInstallerSha256 ? " + checksum" : " + no checksum"}.`
-          : `No update. Current ${info.currentVersion}.`,
-        source === "startup-auto" ? "startup-auto" : "manual",
-      );
-      if (info.hasUpdate) {
-        if (!ignoreDeferrals && skipped) {
-          if (!silent) {
-            setRuntimeMsg(`Version ${info.latestVersion} is currently skipped.`);
-          }
-        } else if (!ignoreDeferrals && snoozed) {
-          if (!silent) {
-            setRuntimeMsg(`Update ${info.latestVersion} is snoozed until ${new Date(updateRemindUntilMs).toLocaleString()}.`);
-          }
-        } else if (!silent) {
-          setRuntimeMsg(`Update available: ${info.currentVersion} -> ${info.latestVersion}.`);
-        }
-      } else if (!silent) {
-        setRuntimeMsg(`Dictum is up to date (${info.currentVersion}).`);
-      }
+      setDiagnosticsLoading(true);
+      const bundle = await getDiagnosticsBundle();
+      setDiagnosticsBundle(bundle);
+      return bundle;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      appendUpdateTelemetry(
-        "check.failed",
-        msg,
-        source === "startup-auto" ? "startup-auto" : "manual",
-      );
-      if (!silent) {
-        setRuntimeMsg(`Update check failed: ${msg}`);
+      if (showErrors) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setRuntimeMsg(`Failed to load diagnostics: ${msg}`);
       }
+      return null;
     } finally {
-      setIsCheckingUpdate(false);
+      setDiagnosticsLoading(false);
     }
-  }, [appendUpdateTelemetry, isCheckingUpdate, updateRemindUntilMs, updateRepoSlug, updateSkipVersion]);
-
-  const handleInstallUpdate = useCallback(async (options?: UpdateInstallOptions) => {
-    if (isInstallingUpdate) return;
-    const assetUrl = updateInfo?.assetDownloadUrl;
-    const expectedSha256 = updateInfo?.expectedInstallerSha256;
-    if (!assetUrl) {
-      setRuntimeMsg("No installer asset found for this release.");
-      appendUpdateTelemetry("install.skipped", "No installer asset in selected release.", "system");
-      return;
-    }
-    if (!expectedSha256) {
-      setRuntimeMsg("No trusted checksum found for installer. Installation blocked.");
-      appendUpdateTelemetry("install.skipped", "Missing expected installer checksum.", "system");
-      return;
-    }
-    const source = options?.source ?? "manual";
-    const autoExit = options?.autoExit ?? false;
-    setIsInstallingUpdate(true);
-    appendUpdateTelemetry(
-      "install.started",
-      `Launching installer for ${updateInfo?.latestVersion ?? "unknown version"}. autoExit=${autoExit}`,
-      source === "idle-auto" ? "idle-auto" : source === "banner" ? "manual" : "manual",
-    );
-    try {
-      const result = await downloadAndInstallAppUpdate(
-        assetUrl,
-        updateInfo?.assetName ?? null,
-        true,
-        autoExit,
-        expectedSha256,
-      );
-      appendUpdateTelemetry(
-        "install.launched",
-        `${result} autoExit=${autoExit}`,
-        source === "idle-auto" ? "idle-auto" : source === "banner" ? "manual" : "manual",
-      );
-      setRuntimeMsg(autoExit
-        ? `${result} Dictum will close to complete installation.`
-        : `${result} Close Dictum to finish update if prompted.`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      appendUpdateTelemetry(
-        "install.failed",
-        msg,
-        source === "idle-auto" ? "idle-auto" : source === "banner" ? "manual" : "manual",
-      );
-      setRuntimeMsg(`Update install failed: ${msg}`);
-    } finally {
-      setIsInstallingUpdate(false);
-    }
-  }, [appendUpdateTelemetry, isInstallingUpdate, updateInfo]);
-
-  const handleRemindLater = useCallback(() => {
-    const remindUntil = Date.now() + (24 * 60 * 60 * 1000);
-    setUpdateRemindUntilMs(remindUntil);
-    appendUpdateTelemetry(
-      "defer.remind_later",
-      `Snoozed until ${new Date(remindUntil).toISOString()}.`,
-      "manual",
-    );
-    setRuntimeMsg(`Update reminder snoozed until ${new Date(remindUntil).toLocaleString()}.`);
-  }, [appendUpdateTelemetry]);
-
-  const handleSkipUpdateVersion = useCallback(() => {
-    if (!updateInfo?.latestVersion) return;
-    setUpdateSkipVersion(updateInfo.latestVersion);
-    appendUpdateTelemetry("defer.skip_version", `Skipped ${updateInfo.latestVersion}.`, "manual");
-    setRuntimeMsg(`Skipped update ${updateInfo.latestVersion}.`);
-  }, [appendUpdateTelemetry, updateInfo]);
-
-  const clearUpdateDeferrals = useCallback(() => {
-    setUpdateSkipVersion(null);
-    setUpdateRemindUntilMs(0);
-    appendUpdateTelemetry("defer.cleared", "Cleared skip/snooze preferences.", "manual");
-    setRuntimeMsg("Cleared update skip/reminder preferences.");
-  }, [appendUpdateTelemetry]);
-
-  const handleExportUpdateTelemetry = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(updateTelemetry, null, 2));
-      setUpdateLogCopied("done");
-      setRuntimeMsg("Copied updater telemetry log to clipboard.");
-    } catch {
-      setUpdateLogCopied("error");
-      setRuntimeMsg("Failed to copy updater telemetry log.");
-    }
-  }, [updateTelemetry]);
+  }, []);
 
   const handleCopyDiagnosticsBundle = useCallback(async () => {
     try {
-      const bundle = await getDiagnosticsBundle();
+      const bundle = (await refreshDiagnostics()) ?? (await getDiagnosticsBundle());
       const exportPayload = {
         ...bundle,
         uiDiagnostics: {
           copiedAt: new Date().toISOString(),
           updateTelemetry,
+          correctionUiState: {
+            scope: correctionScope,
+            activeContext: activeCorrectionContext,
+            effectiveSuggestionMode,
+          },
           updateState: {
-            repoSlug: updateRepoSlug.trim() || DEFAULT_UPDATE_REPO,
+            repoSlug: updateRepoSlug.trim() || "sinergaoptima/dictum",
             autoCheckEnabled: updateAutoCheckEnabled,
             autoInstallWhenIdle: updateAutoInstallWhenIdle,
             skipVersion: updateSkipVersion,
@@ -874,97 +703,35 @@ export default function Home() {
     updateRepoSlug,
     updateSkipVersion,
     updateTelemetry,
+    refreshDiagnostics,
   ]);
 
+  const handleExportDiagnosticsBundle = useCallback(async () => {
+    try {
+      setDiagnosticsExporting(true);
+      const result = await exportDiagnosticsBundle();
+      setLastDiagnosticsExportPath(result.path);
+      await refreshDiagnostics(false);
+      setRuntimeMsg(`Exported diagnostics file to ${result.path}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRuntimeMsg(`Failed to export diagnostics bundle: ${msg}`);
+    } finally {
+      setDiagnosticsExporting(false);
+    }
+  }, [refreshDiagnostics]);
+
   useEffect(() => {
-    if (!updateAutoCheckEnabled || autoUpdateCheckedRef.current) return;
-    if (showOnboarding) return;
-    autoUpdateCheckedRef.current = true;
-    const timer = window.setTimeout(() => {
-      void handleCheckForUpdates({ silent: true, ignoreDeferrals: false, source: "startup-auto" });
-    }, 9000);
+    if (readinessChecklistCopied === "idle") return;
+    const timer = window.setTimeout(() => setReadinessChecklistCopied("idle"), 1600);
     return () => window.clearTimeout(timer);
-  }, [handleCheckForUpdates, showOnboarding, updateAutoCheckEnabled]);
+  }, [readinessChecklistCopied]);
 
   useEffect(() => {
-    if (!updateAutoInstallWhenIdle) return;
-    if (showOnboarding) return;
-    if (!updateInfo?.hasUpdate || !updateInfo.assetDownloadUrl || !updateInfo.expectedInstallerSha256) return;
-    if (isListening || isInstallingUpdate || isCheckingUpdate) return;
-    if (updateSkipVersion && updateSkipVersion === updateInfo.latestVersion) return;
-    if (updateRemindUntilMs > Date.now()) return;
-
-    const checkIdleAndInstall = () => {
-      const latestVersion = updateInfo.latestVersion;
-      if (!latestVersion) return;
-      if (autoInstallAttemptedForVersionRef.current === latestVersion) return;
-      if (isListening || isInstallingUpdate || isCheckingUpdate) return;
-      const idleForMs = Date.now() - lastUserInteractionAtRef.current;
-      if (idleForMs < UPDATE_IDLE_INSTALL_GRACE_MS) return;
-      autoInstallAttemptedForVersionRef.current = latestVersion;
-      appendUpdateTelemetry(
-        "install.auto_idle_triggered",
-        `Idle for ${Math.round(idleForMs / 1000)}s. Launching silent install for ${latestVersion}.`,
-        "idle-auto",
-      );
-      void handleInstallUpdate({ source: "idle-auto", autoExit: true });
-    };
-
-    const timer = window.setInterval(checkIdleAndInstall, 12_000);
-    checkIdleAndInstall();
-    return () => window.clearInterval(timer);
-  }, [
-    appendUpdateTelemetry,
-    handleInstallUpdate,
-    isCheckingUpdate,
-    isInstallingUpdate,
-    isListening,
-    showOnboarding,
-    updateAutoInstallWhenIdle,
-    updateInfo,
-    updateRemindUntilMs,
-    updateSkipVersion,
-  ]);
-
-  useEffect(() => {
-    if (!updateInfo?.hasUpdate) {
-      autoInstallAttemptedForVersionRef.current = null;
-      return;
-    }
-    if (autoInstallAttemptedForVersionRef.current && autoInstallAttemptedForVersionRef.current !== updateInfo.latestVersion) {
-      autoInstallAttemptedForVersionRef.current = null;
-    }
-  }, [updateInfo]);
-
-  const handleLearnCorrection = useCallback(async () => {
-    const heard = correctionHeardInput.trim();
-    const corrected = correctionFixedInput.trim();
-    if (!heard || !corrected) {
-      setRuntimeMsg("Enter both heard and corrected text.");
-      return;
-    }
-    try {
-      const rules = await learnCorrection(heard, corrected);
-      setLearnedCorrections(rules);
-      setCorrectionHeardInput("");
-      setCorrectionFixedInput("");
-      setRuntimeMsg(`Learned correction: "${heard}" -> "${corrected}".`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setRuntimeMsg(`Failed to learn correction: ${msg}`);
-    }
-  }, [correctionFixedInput, correctionHeardInput]);
-
-  const handleDeleteCorrection = useCallback(async (heard: string, corrected: string) => {
-    try {
-      const rules = await deleteLearnedCorrection(heard, corrected);
-      setLearnedCorrections(rules);
-      setRuntimeMsg(`Removed correction for "${heard}".`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setRuntimeMsg(`Failed to remove correction: ${msg}`);
-    }
-  }, []);
+    if (tab !== "stats") return;
+    if (diagnosticsBundle && !diagnosticsLoading) return;
+    void refreshDiagnostics(false);
+  }, [diagnosticsBundle, diagnosticsLoading, refreshDiagnostics, tab]);
 
   const startInlineFix = useCallback((segmentId: string, heardText: string) => {
     setActiveFixSegmentId(segmentId);
@@ -979,8 +746,12 @@ export default function Home() {
       return;
     }
     try {
-      const rules = await learnCorrection(heard, corrected);
-      setLearnedCorrections(rules);
+      await applyCorrection(
+        heard,
+        corrected,
+        activeCorrectionContext.modeAffinity,
+        activeCorrectionContext.appProfileAffinity,
+      );
       setCorrectionHeardInput("");
       setCorrectionFixedInput("");
       setActiveFixSegmentId(null);
@@ -990,18 +761,47 @@ export default function Home() {
       const msg = err instanceof Error ? err.message : String(err);
       setRuntimeMsg(`Failed to save correction: ${msg}`);
     }
-  }, [activeFixText]);
+  }, [activeCorrectionContext.appProfileAffinity, activeCorrectionContext.modeAffinity, activeFixText, applyCorrection, setCorrectionFixedInput, setCorrectionHeardInput]);
 
-  const applySuggestion = useCallback(async (heard: string, corrected: string) => {
+  const applySuggestionWithScope = useCallback(async (
+    heard: string,
+    corrected: string,
+    scope: "current" | DictationMode | "global" | "profile",
+  ) => {
     try {
-      const rules = await learnCorrection(heard, corrected);
-      setLearnedCorrections(rules);
-      setRuntimeMsg(`Applied suggestion: "${heard}" -> "${corrected}".`);
+      let modeAffinity: string | null = null;
+      let appProfileAffinity: string | null = null;
+      if (scope === "current") {
+        modeAffinity = activeCorrectionContext.modeAffinity;
+        appProfileAffinity = activeCorrectionContext.appProfileAffinity;
+      } else if (scope === "profile") {
+        if (!activeAppContext?.matchedProfileId) {
+          setRuntimeMsg("No active app profile is matched right now.");
+          return;
+        }
+        modeAffinity = activeAppContext.dictationMode;
+        appProfileAffinity = activeAppContext.matchedProfileId;
+      } else if (scope === "global") {
+        modeAffinity = null;
+        appProfileAffinity = null;
+      } else {
+        modeAffinity = scope;
+        appProfileAffinity = null;
+      }
+      await applyCorrection(
+        heard,
+        corrected,
+        modeAffinity,
+        appProfileAffinity,
+      );
+      setRuntimeMsg(
+        `Saved suggestion as ${scope === "current" ? "current context" : scope}: "${heard}" -> "${corrected}".`,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setRuntimeMsg(`Failed to apply suggestion: ${msg}`);
     }
-  }, []);
+  }, [activeAppContext, activeCorrectionContext.appProfileAffinity, activeCorrectionContext.modeAffinity, applyCorrection]);
 
   const copyTranscript = useCallback(async () => {
     if (!copyText) return;
@@ -1025,6 +825,7 @@ export default function Home() {
     async (overrides?: Partial<{
       modelProfile: string;
       performanceProfile: string;
+      dictationMode: DictationMode;
       toggleShortcut: string;
       ortEp: string;
       ortIntraThreads: number;
@@ -1049,6 +850,7 @@ export default function Home() {
       const next = {
         modelProfile,
         performanceProfile,
+        dictationMode,
         toggleShortcut,
         ortEp,
         ortIntraThreads,
@@ -1081,6 +883,7 @@ export default function Home() {
         const updated = await setRuntimeSettings(
           next.modelProfile,
           next.performanceProfile,
+          next.dictationMode,
           next.toggleShortcut,
           next.ortEp,
           next.ortIntraThreads,
@@ -1104,6 +907,7 @@ export default function Home() {
         );
         setModelProfile(updated.modelProfile || "distil-large-v3");
         setPerformanceProfile(updated.performanceProfile || "whisper_balanced_english");
+        setDictationMode((updated.dictationMode || "conversation") as DictationMode);
         setToggleShortcut(updated.toggleShortcut || "Ctrl+Shift+Space");
         setOrtEp(updated.ortEp || "auto");
         setOrtIntraThreads(updated.ortIntraThreads ?? 0);
@@ -1142,6 +946,7 @@ export default function Home() {
     [
       modelProfile,
       performanceProfile,
+      dictationMode,
       toggleShortcut,
       ortEp,
       ortIntraThreads,
@@ -1164,274 +969,61 @@ export default function Home() {
     ],
   );
 
-  const collectRmsSamples = useCallback(async (durationMs: number): Promise<number[]> => {
-    const startedAt = performance.now();
-    const samples: number[] = [];
-    await new Promise<void>((resolve) => {
-      const timer = window.setInterval(() => {
-        samples.push(latestRmsRef.current);
-        if (performance.now() - startedAt >= durationMs) {
-          window.clearInterval(timer);
-          resolve();
-        }
-      }, 45);
-    });
-    return samples;
-  }, []);
-
-  const completeOnboarding = useCallback(async () => {
-    const ok = await applyRuntime({ onboardingCompleted: true });
-    if (!ok) {
-      return;
-    }
-    setShowOnboarding(false);
-    setRuntimeMsg("Onboarding complete.");
-  }, [applyRuntime]);
-
-  const runMicCalibration = useCallback(async () => {
-    if (isCalibrating) return;
-    setIsCalibrating(true);
-    setCalibrationMsg("Ambient phase: stay silent...");
-    const startedByCalibration = !isListening;
-    try {
-      if (!isListening) {
-        await startEngine(selectedDeviceName);
-        await new Promise((r) => window.setTimeout(r, 450));
-      }
-      const ambient = await collectRmsSamples(2200);
-      setCalibrationMsg("Whisper phase: whisper naturally...");
-      await new Promise((r) => window.setTimeout(r, 250));
-      const whisper = await collectRmsSamples(2600);
-      setCalibrationMsg("Normal speech phase: speak at your usual volume...");
-      await new Promise((r) => window.setTimeout(r, 250));
-      const normal = await collectRmsSamples(2200);
-
-      const ambientP90 = percentile(ambient, 0.9);
-      const whisperP70 = percentile(whisper, 0.7);
-      const normalP80 = percentile(normal, 0.8);
-      const recommendedNoiseGate = clamp(ambientP90 * 1.45, 0.0004, 0.03);
-      const recommendedActivitySensitivity = clamp(
-        0.34 / Math.max(0.0001, whisperP70 - recommendedNoiseGate),
-        1.0,
-        20.0,
-      );
-      const recommendedPillSensitivity = clamp(recommendedActivitySensitivity * 1.12, 1.0, 20.0);
-      const recommendedInputGainBoost = clamp(0.02 / Math.max(0.0001, whisperP70), 0.5, 8.0);
-      const recommendedClipThreshold = clamp(
-        Math.max(normalP80 * 3.2, ambientP90 * 12, whisperP70 * 8),
-        0.12,
-        0.95,
-      );
-
-      setActivityNoiseGate(recommendedNoiseGate);
-      setActivitySensitivity(recommendedActivitySensitivity);
-      setActivityClipThreshold(recommendedClipThreshold);
-      setPillVisualizerSensitivity(recommendedPillSensitivity);
-      setInputGainBoost(recommendedInputGainBoost);
-
-      if (selectedDeviceName) {
-        try {
-          const raw = localStorage.getItem(MIC_CALIBRATION_STORAGE_KEY);
-          const all = (raw ? JSON.parse(raw) : {}) as Record<string, MicCalibration>;
-          all[selectedDeviceName] = {
-            pillVisualizerSensitivity: recommendedPillSensitivity,
-            activitySensitivity: recommendedActivitySensitivity,
-            activityNoiseGate: recommendedNoiseGate,
-            activityClipThreshold: recommendedClipThreshold,
-            inputGainBoost: recommendedInputGainBoost,
-          };
-          localStorage.setItem(MIC_CALIBRATION_STORAGE_KEY, JSON.stringify(all));
-        } catch {
-          // Ignore local storage errors.
-        }
-      }
-
-      await applyRuntime({
-        pillVisualizerSensitivity: recommendedPillSensitivity,
-        activitySensitivity: recommendedActivitySensitivity,
-        activityNoiseGate: recommendedNoiseGate,
-        activityClipThreshold: recommendedClipThreshold,
-        inputGainBoost: recommendedInputGainBoost,
-      });
-      const envLabel = ambientP90 > 0.01 ? "noisy" : "stable";
-      setCalibrationMsg(
-        `Diagnostics complete (${envLabel} room). Sensitivity + gain tuned for whispers and normal speech.`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setCalibrationMsg(`Calibration failed: ${msg}`);
-    } finally {
-      if (startedByCalibration) {
-        await stopEngine().catch(() => undefined);
-      }
-      setIsCalibrating(false);
-    }
-  }, [
+  const {
+    completeOnboarding,
+    runMicCalibration,
+    runBenchmarkTune,
     isCalibrating,
-    isListening,
-    selectedDeviceName,
-    startEngine,
-    collectRmsSamples,
-    applyRuntime,
-    stopEngine,
-  ]);
-
-  const runBenchmarkTune = useCallback(async () => {
-    if (isBenchmarkTuning) return;
-    setIsBenchmarkTuning(true);
-    setCalibrationMsg("Benchmark ambient phase: stay silent...");
-    const startedByBenchmark = !isListening;
-    try {
-      if (!isListening) {
-        await startEngine(selectedDeviceName);
-        await new Promise((r) => window.setTimeout(r, 500));
-      }
-
-      const ambient = await collectRmsSamples(2300);
-      setCalibrationMsg("Benchmark whisper phase: whisper two short phrases...");
-      await new Promise((r) => window.setTimeout(r, 280));
-      const whisper = await collectRmsSamples(2700);
-      setCalibrationMsg("Benchmark normal phase: speak naturally...");
-      await new Promise((r) => window.setTimeout(r, 280));
-      const normal = await collectRmsSamples(2500);
-      setCalibrationMsg("Collecting latency/fallback telemetry...");
-      await new Promise((r) => window.setTimeout(r, 900));
-      const perf = await getPerfSnapshot();
-
-      const ambientP90 = percentile(ambient, 0.9);
-      const whisperP70 = percentile(whisper, 0.7);
-      const normalP80 = percentile(normal, 0.8);
-      const finalizeP95 = perf.finalizeMs?.p95Ms ?? 0;
-      const fallbackRate = perf.diagnostics.finalSegmentsSeen
-        ? (perf.diagnostics.fallbackStubTyped / perf.diagnostics.finalSegmentsSeen) * 100
-        : 0;
-
-      const tuned = await runBenchmarkAutoTune(
-        ambientP90,
-        whisperP70,
-        normalP80,
-        finalizeP95,
-        fallbackRate,
-      );
-      const runtime = tuned.runtimeSettings;
-      setModelProfile(runtime.modelProfile || "distil-large-v3");
-      setPerformanceProfile(runtime.performanceProfile || "whisper_balanced_english");
-      setToggleShortcut(runtime.toggleShortcut || "Ctrl+Shift+Space");
-      setOrtEp(runtime.ortEp || "auto");
-      setOrtIntraThreads(runtime.ortIntraThreads ?? 0);
-      setOrtInterThreads(runtime.ortInterThreads ?? 0);
-      setOrtParallel(runtime.ortParallel ?? true);
-      setLanguageHint(runtime.languageHint || "english");
-      setPillVisualizerSensitivity(runtime.pillVisualizerSensitivity || 10);
-      setActivitySensitivity(runtime.activitySensitivity || 4.2);
-      setActivityNoiseGate(runtime.activityNoiseGate ?? 0.0015);
-      setActivityClipThreshold(runtime.activityClipThreshold ?? 0.32);
-      setInputGainBoost(runtime.inputGainBoost || 1);
-      setRuntimeMsg(tuned.summary);
-      setCalibrationMsg(
-        `Benchmark tune complete. p95 ${Math.round(
-          tuned.measuredFinalizeP95Ms,
-        )}ms · fallback ${tuned.measuredFallbackRatePct.toFixed(1)}%.`,
-      );
-      const refreshedRecommendation = await getModelProfileRecommendation();
-      setModelRecommendation(refreshedRecommendation);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setCalibrationMsg(`Benchmark tune failed: ${msg}`);
-    } finally {
-      if (startedByBenchmark) {
-        await stopEngine().catch(() => undefined);
-      }
-      setIsBenchmarkTuning(false);
-    }
-  }, [
-    collectRmsSamples,
-    getPerfSnapshot,
     isBenchmarkTuning,
-    isListening,
+    guidedTuneStepLabel,
+    guidedTuneInstruction,
+    guidedTuneSentence,
+    guidedTuneProgressPct,
+    guidedTuneCompletedForDevice,
+  } = useGuidedTune({
     selectedDeviceName,
+    isListening,
     startEngine,
     stopEngine,
-  ]);
-
-  const setPanelBusy = useCallback((panel: keyof PanelLoadingState, busy: boolean) => {
-    setPanelLoading((prev) => (prev[panel] === busy ? prev : { ...prev, [panel]: busy }));
-  }, []);
-
-  const shouldUsePanelCache = useCallback(
-    (panel: keyof PanelLoadingState, force: boolean) =>
-      !force && Date.now() - panelLoadedAtRef.current[panel] < PANEL_CACHE_TTL_MS,
-    [],
-  );
-
-  const refreshHistory = useCallback(async (force = false, query = historyQuery.trim()) => {
-    if (!force && !query && shouldUsePanelCache("history", false)) {
-      return;
-    }
-    setPanelBusy("history", true);
-    try {
-      const page = await getHistory(1, 100, query || null);
-      setHistoryItems(page.items);
-      panelLoadedAtRef.current.history = Date.now();
-    } finally {
-      setPanelBusy("history", false);
-    }
-  }, [historyQuery, setPanelBusy, shouldUsePanelCache]);
-
-  const refreshStats = useCallback(async (force = false) => {
-    if (!force && shouldUsePanelCache("stats", false)) {
-      return;
-    }
-    setPanelBusy("stats", true);
-    try {
-      const [statsData, perfData] = await Promise.all([getStats(30), getPerfSnapshot()]);
-      setStats(statsData);
-      setPerfSnapshot(perfData);
-      panelLoadedAtRef.current.stats = Date.now();
-    } finally {
-      setPanelBusy("stats", false);
-    }
-  }, [setPanelBusy, shouldUsePanelCache]);
-
-  const refreshDictionary = useCallback(async (force = false) => {
-    if (!force && shouldUsePanelCache("dictionary", false)) {
-      return;
-    }
-    setPanelBusy("dictionary", true);
-    try {
-      setDictionary(await getDictionary());
-      panelLoadedAtRef.current.dictionary = Date.now();
-    } finally {
-      setPanelBusy("dictionary", false);
-    }
-  }, [setPanelBusy, shouldUsePanelCache]);
-
-  const refreshSnippets = useCallback(async (force = false) => {
-    if (!force && shouldUsePanelCache("snippets", false)) {
-      return;
-    }
-    setPanelBusy("snippets", true);
-    try {
-      setSnippets(await getSnippets());
-      panelLoadedAtRef.current.snippets = Date.now();
-    } finally {
-      setPanelBusy("snippets", false);
-    }
-  }, [setPanelBusy, shouldUsePanelCache]);
-
-  useEffect(() => {
-    if (tab === "stats") void refreshStats();
-    if (tab === "dictionary") void refreshDictionary();
-    if (tab === "snippets") void refreshSnippets();
-  }, [tab, refreshHistory, refreshStats, refreshDictionary, refreshSnippets]);
-
-  useEffect(() => {
-    if (tab !== "history") return;
-    const timer = window.setTimeout(() => {
-      void refreshHistory(true, deferredHistoryQuery);
-    }, HISTORY_SEARCH_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
-  }, [deferredHistoryQuery, refreshHistory, tab]);
+    latestRmsRef,
+    applyRuntime,
+    setRuntimeMsg,
+    setCalibrationMsg,
+    setModelProfile,
+    setPerformanceProfile,
+    setDictationMode,
+    setToggleShortcut,
+    setOrtEp,
+    setOrtIntraThreads,
+    setOrtInterThreads,
+    setOrtParallel,
+    setLanguageHint,
+    setPillVisualizerSensitivity,
+    setActivitySensitivity,
+    setActivityNoiseGate,
+    setActivityClipThreshold,
+    setInputGainBoost,
+    setPostUtteranceRefine,
+    setPhraseBiasTerms,
+    setCloudMode,
+    setCloudOptIn,
+    setReliabilityMode,
+    setModelRecommendation,
+    showOnboarding,
+    setShowOnboarding,
+  });
+  const {
+    historyItems,
+    stats,
+    perfSnapshot,
+    dictionary,
+    snippets,
+    panelLoading,
+    refreshHistory,
+    refreshStats,
+    refreshDictionary,
+    refreshSnippets,
+  } = usePanelData(tab, historyQuery);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1515,6 +1107,100 @@ export default function Home() {
   const inferenceP95 = perfSnapshot?.inferenceMs.p95Ms ?? 0;
   const duplicateFinalSuppressed = perfSnapshot?.diagnostics.duplicateFinalSuppressed ?? 0;
   const partialRescuesUsed = perfSnapshot?.diagnostics.partialRescuesUsed ?? 0;
+  const correctionDiagnostics = diagnosticsBundle?.correctionDiagnostics ?? null;
+  const settingsHealth = diagnosticsBundle?.settingsHealth ?? null;
+  const currentContextRuleCount = correctionHealthSummary.currentContextRules;
+  const readinessItems = useMemo(
+    () => [
+      {
+        label: "Guided tune",
+        value: guidedTuneCompletedForDevice ? "Ready" : "Needs tune",
+        ok: guidedTuneCompletedForDevice,
+        detail: guidedTuneCompletedForDevice
+          ? "Current mic has completed the guided tune."
+          : "Run the 30-second guided voice tune for the current device.",
+      },
+      {
+        label: "Model selection",
+        value:
+          modelRecommendation && modelRecommendation.recommendedProfile !== modelProfile
+            ? "Review recommended"
+            : "Aligned",
+        ok: !modelRecommendation || modelRecommendation.recommendedProfile === modelProfile,
+        detail: modelRecommendation
+          ? `Recommended ${modelRecommendation.recommendedProfile}. Current ${modelProfile}.`
+          : `Current model ${modelProfile}.`,
+      },
+      {
+        label: "Active profile",
+        value: activeAppContext?.matchedProfileName || "No match",
+        ok: !!activeAppContext?.matchedProfileName,
+        detail: activeAppContext?.foregroundApp
+          ? `Foreground ${activeAppContext.foregroundApp}.`
+          : "No foreground app detected from the backend.",
+      },
+      {
+        label: "Corrections",
+        value: `${learnedCorrections.length} rules`,
+        ok:
+          learnedCorrections.length > 0 &&
+          correctionHealthSummary.orphanedProfileRules === 0,
+        detail: `${currentContextRuleCount} rules match the current context. ${correctionHealthSummary.orphanedProfileRules} orphaned, ${correctionHealthSummary.staleRules} stale.`,
+      },
+      {
+        label: "Settings health",
+        value: settingsHealth
+          ? `Schema v${settingsHealth.currentSchemaVersion}`
+          : "Not inspected yet",
+        ok: !!settingsHealth,
+        detail: settingsHealth
+          ? settingsHealth.migrationNotes.length > 0
+            ? settingsHealth.migrationNotes.join(" ")
+            : `Loaded schema v${settingsHealth.loadedSchemaVersion}. No migration notes were recorded.`
+          : "Refresh diagnostics to inspect settings schema and migration notes.",
+      },
+      {
+        label: "Diagnostics export",
+        value: lastDiagnosticsExportPath ? "Exported" : "Not exported yet",
+        ok: !!lastDiagnosticsExportPath,
+        detail: lastDiagnosticsExportPath ?? "Use Export File in Stats to write a local diagnostics bundle.",
+      },
+      {
+        label: "Update path",
+        value: updateInfo?.hasUpdate ? `Update ${updateInfo.latestVersion}` : "No pending update",
+        ok: true,
+        detail: `Repo ${updateRepoSlug.trim() || "sinergaoptima/dictum"}.`,
+      },
+    ],
+    [
+      activeAppContext?.foregroundApp,
+      activeAppContext?.matchedProfileName,
+      correctionHealthSummary.orphanedProfileRules,
+      correctionHealthSummary.staleRules,
+      currentContextRuleCount,
+      guidedTuneCompletedForDevice,
+      lastDiagnosticsExportPath,
+      learnedCorrections.length,
+      modelProfile,
+      modelRecommendation,
+      settingsHealth,
+      updateInfo?.hasUpdate,
+      updateInfo?.latestVersion,
+      updateRepoSlug,
+    ],
+  );
+  const readinessBlockingItems = useMemo(
+    () => readinessItems.filter((item) => !item.ok),
+    [readinessItems],
+  );
+  const readinessChecklistText = useMemo(
+    () =>
+      [
+        "Dictum 0.1.9-dev.1 readiness checklist",
+        ...readinessItems.map((item) => `- [${item.ok ? "x" : " "}] ${item.label}: ${item.value} (${item.detail})`),
+      ].join("\n"),
+    [readinessItems],
+  );
   const nowMs = Date.now();
   const updateIsSkipped = !!(updateInfo?.hasUpdate && updateSkipVersion && updateInfo.latestVersion === updateSkipVersion);
   const updateIsSnoozed = !!(updateInfo?.hasUpdate && updateRemindUntilMs > nowMs);
@@ -1655,17 +1341,41 @@ export default function Home() {
                 ))}
                 {correctionSuggestions.length > 0 && (
                   <div className="suggestion-strip">
-                    <span className="suggestion-label">Likely corrections</span>
+                    <span className="suggestion-label">
+                      Likely corrections · {effectiveSuggestionMode}
+                    </span>
                     {correctionSuggestions.map((s) => (
-                      <button
+                      <div
                         key={s.id}
-                        type="button"
                         className="suggestion-chip"
-                        onClick={() => void applySuggestion(s.heard, s.corrected)}
-                        title={`confidence ${(s.confidence * 100).toFixed(0)}%`}
                       >
-                        {s.corrected}
-                      </button>
+                        <button
+                          type="button"
+                          className="suggestion-chip-main"
+                          onClick={() => void applySuggestionWithScope(s.heard, s.corrected, "current")}
+                          title={`${s.scopeLabel} · ${s.usageLabel} · confidence ${(s.confidence * 100).toFixed(0)}%${s.lastUsedAt ? ` · used ${new Date(s.lastUsedAt).toLocaleString()}` : ""}`}
+                        >
+                          <span>{s.corrected}</span>
+                          <small>{s.scopeLabel} · {s.usageLabel}</small>
+                        </button>
+                        <div className="suggestion-actions">
+                          <button type="button" className="suggestion-scope-btn" onClick={() => void applySuggestionWithScope(s.heard, s.corrected, "global")}>
+                            Global
+                          </button>
+                          <button type="button" className="suggestion-scope-btn" onClick={() => void applySuggestionWithScope(s.heard, s.corrected, effectiveSuggestionMode)}>
+                            {effectiveSuggestionMode}
+                          </button>
+                          <button
+                            type="button"
+                            className="suggestion-scope-btn"
+                            onClick={() => void applySuggestionWithScope(s.heard, s.corrected, "profile")}
+                            disabled={!activeAppContext?.matchedProfileId}
+                            title={activeAppContext?.matchedProfileName ? `Save only for ${activeAppContext.matchedProfileName}` : "No active app profile"}
+                          >
+                            {activeAppContext?.matchedProfileName ? "Profile" : "No Profile"}
+                          </button>
+                        </div>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -1848,11 +1558,24 @@ export default function Home() {
           {tab === "stats" && (
             <section className="panel">
               <div className="panel-toolbar">
-                <button className="action-btn" onClick={() => void refreshStats(true)} disabled={panelLoading.stats}>
-                  {panelLoading.stats ? "Refreshing..." : "Refresh"}
+                <button
+                  className="action-btn"
+                  onClick={() => void (async () => {
+                    await Promise.all([refreshStats(true), refreshDiagnostics(true)]);
+                  })()}
+                  disabled={panelLoading.stats || diagnosticsLoading}
+                >
+                  {panelLoading.stats || diagnosticsLoading ? "Refreshing..." : "Refresh"}
                 </button>
                 <button className="action-btn" onClick={() => void handleCopyDiagnosticsBundle()}>
                   Copy Diagnostics
+                </button>
+                <button
+                  className="action-btn"
+                  onClick={() => void handleExportDiagnosticsBundle()}
+                  disabled={diagnosticsExporting}
+                >
+                  {diagnosticsExporting ? "Exporting..." : "Export File"}
                 </button>
               </div>
               {panelLoading.stats && !stats ? (
@@ -1862,43 +1585,274 @@ export default function Home() {
                   <p>Gathering recent usage and performance telemetry.</p>
                 </div>
               ) : stats ? (
-                <motion.div
-                  className="panel-grid"
-                  initial="hidden"
-                  animate="visible"
-                  variants={{
-                    hidden: { opacity: 0 },
-                    visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
-                  }}
-                >
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{stats.totalUtterances}</b><span>Utterances</span>
+                <>
+                  <motion.div
+                    className="panel-grid"
+                    initial="hidden"
+                    animate="visible"
+                    variants={{
+                      hidden: { opacity: 0 },
+                      visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
+                    }}
+                  >
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{stats.totalUtterances}</b><span>Utterances</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{stats.totalWords}</b><span>Words</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{Math.round(stats.avgLatencyMs)} ms</b><span>Avg Latency</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{`${Math.round(fallbackStubRate)}%`}</b><span>Fallback Stub Rate</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{perfSnapshot?.diagnostics.shortcutToggleDropped ?? 0}</b><span>Shortcut Drops</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{Math.round(finalizeP95)} ms</b><span>Finalize p95</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{Math.round(inferenceP95)} ms</b><span>Inference p95</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{duplicateFinalSuppressed}</b><span>Duplicate Finals Blocked</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{partialRescuesUsed}</b><span>Partial Rescues</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.totalRules ?? learnedCorrections.length}</b><span>Correction Rules</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{currentContextRuleCount}</b><span>Current Context Rules</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.unusedRules ?? 0}</b><span>Unused Rules</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.orphanedProfileRules ?? correctionHealthSummary.orphanedProfileRules}</b><span>Orphaned Profile Rules</span>
+                    </motion.div>
+                    <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
+                      <b>{correctionDiagnostics?.staleRules ?? correctionHealthSummary.staleRules}</b><span>Stale Rules</span>
+                    </motion.div>
                   </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{stats.totalWords}</b><span>Words</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{Math.round(stats.avgLatencyMs)} ms</b><span>Avg Latency</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{`${Math.round(fallbackStubRate)}%`}</b><span>Fallback Stub Rate</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{perfSnapshot?.diagnostics.shortcutToggleDropped ?? 0}</b><span>Shortcut Drops</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{Math.round(finalizeP95)} ms</b><span>Finalize p95</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{Math.round(inferenceP95)} ms</b><span>Inference p95</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{duplicateFinalSuppressed}</b><span>Duplicate Finals Blocked</span>
-                  </motion.div>
-                  <motion.div className="stat-card" variants={{ hidden: { opacity: 0, scale: 0.9, y: 10 }, visible: { opacity: 1, scale: 1, y: 0 } }}>
-                    <b>{partialRescuesUsed}</b><span>Partial Rescues</span>
-                  </motion.div>
-                </motion.div>
+                  {correctionDiagnostics && (
+                  <div className="settings-stack">
+                    <article className="settings-card">
+                      <div className="settings-card-header">
+                        <h3>Correction Diagnostics</h3>
+                        <p>Rule coverage for the current context and the correction rules Dictum is leaning on most.</p>
+                      </div>
+                      <div className="panel-grid">
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.globalRules}</b><span>Global Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.modeScopedRules}</b><span>Mode Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.profileScopedRules}</b><span>Profile Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.orphanedProfileRules}</b><span>Orphaned Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{correctionDiagnostics.staleRules}</b><span>Stale Rules</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{diagnosticsBundle?.activeAppContext.foregroundApp || "none"}</b><span>Foreground App</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{diagnosticsBundle?.activeAppContext.matchedProfileName || "none"}</b><span>Matched Profile</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{diagnosticsBundle?.activeAppContext.dictationMode || effectiveSuggestionMode}</b><span>Effective Mode</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{diagnosticsBundle?.activeAppContext.phraseBiasTermCount ?? 0}</b><span>Bias Terms</span>
+                        </div>
+                      </div>
+                      <div className="settings-split-grid">
+                        <div className="panel-list">
+                          <p className="settings-note">Most used rules</p>
+                          {correctionDiagnostics.topRules.slice(0, 5).map((rule) => (
+                            <article
+                              key={`top:${rule.heard}:${rule.corrected}:${rule.modeAffinity || "any"}:${rule.appProfileAffinity || "all"}`}
+                              className={`panel-card ${matchesCorrectionContext(rule, activeAppContext?.matchedProfileId ?? null, effectiveSuggestionMode) ? "is-active" : ""}`}
+                            >
+                              <div className="panel-meta">
+                                <span>{rule.heard}</span>
+                                <span>→</span>
+                                <span>{rule.corrected}</span>
+                                <span>hits {rule.hits}</span>
+                              </div>
+                              <p>
+                                {rule.appProfileName
+                                  ? `Profile ${rule.appProfileName}`
+                                  : rule.modeAffinity
+                                    ? `Mode ${rule.modeAffinity}`
+                                    : "Global"}
+                                {rule.lastUsedAt ? ` · used ${new Date(rule.lastUsedAt).toLocaleString()}` : ""}
+                              </p>
+                            </article>
+                          ))}
+                        </div>
+                        <div className="panel-list">
+                          <p className="settings-note">Recently active rules</p>
+                          {correctionDiagnostics.recentRules.slice(0, 5).map((rule) => (
+                            <article
+                              key={`recent:${rule.heard}:${rule.corrected}:${rule.modeAffinity || "any"}:${rule.appProfileAffinity || "all"}`}
+                              className={`panel-card ${matchesCorrectionContext(rule, activeAppContext?.matchedProfileId ?? null, effectiveSuggestionMode) ? "is-active" : ""}`}
+                            >
+                              <div className="panel-meta">
+                                <span>{rule.heard}</span>
+                                <span>→</span>
+                                <span>{rule.corrected}</span>
+                                <span>hits {rule.hits}</span>
+                              </div>
+                              <p>
+                                {rule.appProfileName
+                                  ? `Profile ${rule.appProfileName}`
+                                  : rule.modeAffinity
+                                    ? `Mode ${rule.modeAffinity}`
+                                    : "Global"}
+                                {rule.lastUsedAt ? ` · used ${new Date(rule.lastUsedAt).toLocaleString()}` : ""}
+                              </p>
+                            </article>
+                          ))}
+                          {correctionDiagnostics.recentRules.length === 0 && (
+                            <p className="settings-note">No corrections have been used in live dictation yet.</p>
+                          )}
+                        </div>
+                      </div>
+                    </article>
+                  </div>
+                  )}
+                  {settingsHealth && (
+                  <div className="settings-stack">
+                    <article className="settings-card">
+                      <div className="settings-card-header">
+                        <h3>Settings Health</h3>
+                        <p>Schema and migration visibility for the local settings file used by this install.</p>
+                      </div>
+                      <div className="panel-grid">
+                        <div className="stat-card">
+                          <b>v{settingsHealth.loadedSchemaVersion}</b><span>Loaded Schema</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>v{settingsHealth.currentSchemaVersion}</b><span>Current Schema</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{settingsHealth.migrationApplied ? "yes" : "no"}</b><span>Migration Applied</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{settingsHealth.migrationNotes.length}</b><span>Migration Notes</span>
+                        </div>
+                      </div>
+                      <div className="panel-list">
+                        {settingsHealth.migrationNotes.length > 0 ? (
+                          settingsHealth.migrationNotes.map((note) => (
+                            <article key={note} className="panel-card">
+                              <p>{note}</p>
+                            </article>
+                          ))
+                        ) : (
+                          <p className="settings-note">No settings migration notes were recorded for this load.</p>
+                        )}
+                      </div>
+                    </article>
+                  </div>
+                  )}
+                  <div className="settings-stack">
+                    <article className="settings-card">
+                      <div className="settings-card-header">
+                        <h3>Release Readiness</h3>
+                        <p>Quick stabilization readout for the current dev branch before another cut or installer build.</p>
+                      </div>
+                      <div className="settings-inline-actions">
+                        <button
+                          className="action-btn"
+                          onClick={() => void (async () => {
+                            try {
+                              await navigator.clipboard.writeText(readinessChecklistText);
+                              setReadinessChecklistCopied("done");
+                              setRuntimeMsg("Copied readiness checklist to clipboard.");
+                            } catch (err) {
+                              const msg = err instanceof Error ? err.message : String(err);
+                              setReadinessChecklistCopied("error");
+                              setRuntimeMsg(`Failed to copy readiness checklist: ${msg}`);
+                            }
+                          })()}
+                          type="button"
+                        >
+                          {readinessChecklistCopied === "done"
+                            ? "Checklist Copied"
+                            : readinessChecklistCopied === "error"
+                              ? "Copy Failed"
+                              : "Copy Checklist"}
+                        </button>
+                        <span className="settings-note">
+                          {readinessBlockingItems.length === 0
+                            ? "No blocking readiness items are currently flagged."
+                            : `${readinessBlockingItems.length} blocking item${readinessBlockingItems.length === 1 ? "" : "s"} still need attention.`}
+                        </span>
+                      </div>
+                      <div className="settings-split-grid">
+                        {readinessItems.map((item) => (
+                          <article
+                            key={item.label}
+                            className={`panel-card ${item.ok ? "is-active" : "is-editing"}`}
+                          >
+                            <div className="panel-meta">
+                              <span>{item.label}</span>
+                              <span>{item.value}</span>
+                            </div>
+                            <p>{item.detail}</p>
+                          </article>
+                        ))}
+                      </div>
+                    </article>
+                    <article className="settings-card">
+                      <div className="settings-card-header">
+                        <h3>Smoke Benchmark Baseline</h3>
+                        <p>
+                          Repo baseline from the committed smoke fixture pack. Use it as a stable reference when tuning `0.1.9-dev.1`.
+                        </p>
+                      </div>
+                      <div className="panel-grid">
+                        <div className="stat-card">
+                          <b>{smokeBaseline.totalFiles}</b><span>Fixture Files</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{Math.round(smokeBaseline.p95LatencyMs)} ms</b><span>Repo p95 Latency</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{formatPct(smokeBaseline.missRate)}</b><span>Repo Miss Rate</span>
+                        </div>
+                        <div className="stat-card">
+                          <b>{formatPct(smokeBaseline.avgSimilarityToExpected)}</b><span>Expected Similarity</span>
+                        </div>
+                      </div>
+                      <div className="panel-list">
+                        {smokeBaseline.categories.map((category) => (
+                          <article key={category.category} className="panel-card">
+                            <div className="panel-meta">
+                              <span>{category.category}</span>
+                              <span>{category.runs} run{category.runs === 1 ? "" : "s"}</span>
+                              <span>p95 {Math.round(category.p95LatencyMs)} ms</span>
+                              <span>miss {formatPct(category.missRate)}</span>
+                            </div>
+                            <p>
+                              confidence {formatPct(category.avgConfidence)} · similarity {formatPct(category.avgSimilarityToExpected)} · placeholder {formatPct(category.placeholderRate)}
+                            </p>
+                          </article>
+                        ))}
+                      </div>
+                    </article>
+                  </div>
+                </>
               ) : (
                 <div className="empty-slate">
                   <span className="empty-icon" aria-hidden="true">⚗</span>
@@ -1984,6 +1938,19 @@ export default function Home() {
                   <option value="slash">slash</option>
                   <option value="phrase">phrase</option>
                 </select>
+                <div className="settings-chip-row">
+                  {DICTATION_MODE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      className={`settings-chip-btn ${snippetApplyModes.includes(option.value) ? "is-active" : ""}`}
+                      onClick={() => setSnippetApplyModes((prev) => toggleUniqueMode(prev, option.value))}
+                      type="button"
+                      title={`Apply only in ${option.label.toLowerCase()} mode`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
                 <button
                   className="action-btn"
                   onClick={async () => {
@@ -1993,12 +1960,14 @@ export default function Home() {
                       trigger: snippetTrigger.trim(),
                       expansion: snippetExpansion.trim(),
                       mode: snippetMode,
+                      applyModes: snippetApplyModes,
                       enabled: true,
                       createdAt: "",
                       updatedAt: "",
                     });
                     setSnippetTrigger("");
                     setSnippetExpansion("");
+                    setSnippetApplyModes([]);
                     await refreshSnippets(true);
                   }}
                   disabled={panelLoading.snippets}
@@ -2006,6 +1975,9 @@ export default function Home() {
                   {panelLoading.snippets ? "Saving..." : "Add"}
                 </button>
               </div>
+              <p className="settings-note">
+                Leave mode chips unselected to apply a snippet everywhere. Select one or more modes to limit where the snippet expands.
+              </p>
               <div className="panel-list">
                 {panelLoading.snippets && snippets.length === 0 && (
                   <div className="empty-slate">
@@ -2025,6 +1997,11 @@ export default function Home() {
                     <div className="panel-meta">
                       <span>{entry.trigger}</span>
                       <span>{entry.mode}</span>
+                      <span>
+                        {entry.applyModes.length > 0
+                          ? entry.applyModes.join(", ")
+                          : "all modes"}
+                      </span>
                     </div>
                     <p>{entry.expansion}</p>
                     <div className="context-menu">
@@ -2066,10 +2043,10 @@ export default function Home() {
                     Auto Tune
                   </button>
                   <button className="action-btn" onClick={() => void runBenchmarkTune()} disabled={isBenchmarkTuning}>
-                    {isBenchmarkTuning ? "Benchmarking..." : "Benchmark Tune"}
+                    {isBenchmarkTuning ? "Benchmarking..." : "Advanced Benchmark Tune"}
                   </button>
                   <button className="action-btn" onClick={() => void runMicCalibration()} disabled={isCalibrating}>
-                    {isCalibrating ? "Running..." : "Diagnostics Wizard"}
+                    {isCalibrating ? "Guided Tune Running..." : "Guided Voice Tune"}
                   </button>
                   <button className="action-btn settings-save-btn" onClick={() => void applyRuntime()}>
                     Save Settings
@@ -2211,6 +2188,20 @@ export default function Home() {
                       </select>
                     </label>
                     <label className="settings-field">
+                      <span>Dictation Mode</span>
+                      <select
+                        className="settings-input"
+                        value={dictationMode}
+                        onChange={(e) => setDictationMode(e.target.value as DictationMode)}
+                      >
+                        {DICTATION_MODE_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="settings-field">
                       <span>Language</span>
                       <select
                         className="settings-input"
@@ -2326,6 +2317,9 @@ export default function Home() {
                     <h3>Recognition</h3>
                     <p>Bias and post-processing behavior for final transcript quality.</p>
                   </div>
+                  <p className="settings-note">
+                    {DICTATION_MODE_OPTIONS.find((opt) => opt.value === dictationMode)?.hint}
+                  </p>
                   <label className="settings-field">
                     <span>Phrase Bias Terms</span>
                     <textarea
@@ -2346,230 +2340,112 @@ export default function Home() {
                   </label>
                 </article>
 
-                <article className="settings-card">
-                  <div className="settings-card-header">
-                    <h3>Live Corrections</h3>
-                    <p>Teach Dictum how to fix common mishears on future finals.</p>
-                  </div>
-                  <div className="settings-fields">
-                    <label className="settings-field">
-                      <span>Heard</span>
-                      <input
-                        className="settings-input"
-                        value={correctionHeardInput}
-                        onChange={(e) => setCorrectionHeardInput(e.target.value)}
-                        placeholder="ex: ladder labs"
-                      />
-                    </label>
-                    <label className="settings-field">
-                      <span>Corrected</span>
-                      <input
-                        className="settings-input"
-                        value={correctionFixedInput}
-                        onChange={(e) => setCorrectionFixedInput(e.target.value)}
-                        placeholder="ex: Lattice Labs"
-                      />
-                    </label>
-                  </div>
-                  <div className="settings-inline-actions">
-                    <button className="action-btn" onClick={() => void handleLearnCorrection()}>
-                      Learn Correction
-                    </button>
-                    <span className="settings-note">{learnedCorrections.length} learned rules</span>
-                  </div>
-                  <div className="panel-list">
-                    {learnedCorrections.slice(0, 8).map((rule) => (
-                      <article key={`${rule.heard}:${rule.corrected}`} className="panel-card">
-                        <div className="panel-meta">
-                          <span>{rule.heard}</span>
-                          <span>→</span>
-                          <span>{rule.corrected}</span>
-                          <span>hits {rule.hits}</span>
-                        </div>
-                        <button
-                          className="action-btn"
-                          onClick={() => void handleDeleteCorrection(rule.heard, rule.corrected)}
-                        >
-                          Remove
-                        </button>
-                      </article>
-                    ))}
-                    {learnedCorrections.length === 0 && (
-                      <p className="settings-note">No learned corrections yet.</p>
-                    )}
-                  </div>
-                </article>
+                <PerAppProfilesSection
+                  profiles={appProfiles}
+                  activeAppContext={activeAppContext}
+                  globalDictationMode={dictationMode}
+                  globalPhraseBiasCount={phraseBiasTerms.split(/\r?\n|,/).filter(Boolean).length}
+                  profileName={appProfileName}
+                  profileMatch={appProfileMatch}
+                  profileMode={appProfileMode}
+                  profileBiasTerms={appProfileBiasTerms}
+                  profileRefine={appProfileRefine}
+                  editingProfileId={editingAppProfileId}
+                  importText={appProfilesImportText}
+                  copiedState={appProfilesCopied}
+                  modeOptions={DICTATION_MODE_OPTIONS}
+                  presets={APP_PROFILE_PRESETS}
+                  onNameChange={setAppProfileName}
+                  onMatchChange={setAppProfileMatch}
+                  onModeChange={setAppProfileMode}
+                  onBiasTermsChange={setAppProfileBiasTerms}
+                  onRefineChange={setAppProfileRefine}
+                  onImportTextChange={setAppProfilesImportText}
+                  onSave={handleSaveAppProfile}
+                  onCopy={handleCopyAppProfiles}
+                  onImport={handleImportAppProfiles}
+                  onEdit={handleEditAppProfile}
+                  onUseCurrentForegroundApp={handleUseCurrentForegroundApp}
+                  onDuplicate={handleDuplicateAppProfile}
+                  onDelete={handleDeleteAppProfile}
+                  onCancelEdit={resetAppProfileEditor}
+                  onApplyPreset={handleApplyAppProfilePreset}
+                />
 
-                <article className="settings-card">
-                  <div className="settings-card-header">
-                    <h3>Privacy</h3>
-                    <p>Control local retention and cloud fallback behavior.</p>
-                  </div>
-                  <label className="settings-field">
-                    <span>OpenAI API Key</span>
-                    <input
-                      className="settings-input"
-                      type="password"
-                      value={openAiApiKeyInput}
-                      onChange={(e) => setOpenAiApiKeyInput(e.target.value)}
-                      placeholder={hasOpenAiApiKey ? "Saved locally. Enter new key to replace." : "sk-proj-..."}
-                      autoComplete="off"
-                    />
-                  </label>
-                  <div className="settings-inline-actions">
-                    <button
-                      className="action-btn"
-                      disabled={!hasOpenAiApiKey}
-                      onClick={() => void applyRuntime({ openAiApiKey: "" })}
-                    >
-                      Clear Saved Key
-                    </button>
-                    <span className="settings-note">
-                      {hasOpenAiApiKey ? "API key saved locally for this profile." : "No API key saved yet."}
-                    </span>
-                  </div>
-                  <label className="settings-field">
-                    <span>Cloud Mode</span>
-                    <select
-                      className="settings-input"
-                      value={cloudMode}
-                      onChange={(e) => setCloudMode(e.target.value as CloudMode)}
-                    >
-                      {CLOUD_MODE_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <p className="settings-note">
-                    {CLOUD_MODE_OPTIONS.find((opt) => opt.value === cloudMode)?.hint}
-                  </p>
-                  <label className="settings-switch">
-                    <input type="checkbox" checked={historyEnabled} onChange={(e) => setHistoryEnabled(e.target.checked)} />
-                    <span>Save local history</span>
-                  </label>
-                  <p className="settings-note">
-                    {runtimeMsg ?? "Cloud fallback requires an OpenAI API key."}
-                  </p>
-                  <p className="settings-note">
-                    {calibrationMsg ?? "Run mic calibration after changing devices or recording environment."}
-                  </p>
-                </article>
+                <LiveCorrectionsSection
+                  correctionHeardInput={correctionHeardInput}
+                  correctionFixedInput={correctionFixedInput}
+                  correctionsCopied={correctionsCopied}
+                  correctionFilter={correctionFilter}
+                  correctionsImportText={correctionsImportText}
+                  learnedCorrections={learnedCorrections}
+                  filteredLearnedCorrections={filteredLearnedCorrections}
+                  activeAppContext={activeAppContext}
+                  appProfiles={appProfiles}
+                  currentDictationMode={dictationMode}
+                  correctionScope={correctionScope}
+                  correctionFilterScope={correctionFilterScope}
+                  correctionSort={correctionSort}
+                  correctionHealthSummary={correctionHealthSummary}
+                  editingCorrection={editingCorrection}
+                  onCorrectionHeardInputChange={setCorrectionHeardInput}
+                  onCorrectionFixedInputChange={setCorrectionFixedInput}
+                  onCorrectionFilterChange={setCorrectionFilter}
+                  onCorrectionsImportTextChange={setCorrectionsImportText}
+                  onCorrectionScopeChange={setCorrectionScope}
+                  onCorrectionFilterScopeChange={setCorrectionFilterScope}
+                  onCorrectionSortChange={setCorrectionSort}
+                  onLearnCorrection={handleLearnCorrection}
+                  onCopyCorrections={handleCopyCorrections}
+                  onImportCorrections={handleImportCorrections}
+                  onPruneCorrections={handlePruneCorrections}
+                  onDeleteCorrection={handleDeleteCorrection}
+                  onStartEditingCorrection={handleStartEditingCorrection}
+                  onCancelEditingCorrection={handleCancelEditingCorrection}
+                />
 
-                <article className="settings-card">
-                  <div className="settings-card-header">
-                    <h3>App Updates</h3>
-                    <p>Background startup checks, manual check, and installer launch from GitHub Releases.</p>
-                  </div>
-                  <label className="settings-switch">
-                    <input
-                      type="checkbox"
-                      checked={updateAutoCheckEnabled}
-                      onChange={(e) => setUpdateAutoCheckEnabled(e.target.checked)}
-                    />
-                    <span>Auto-check for updates on startup</span>
-                  </label>
-                  <label className="settings-switch">
-                    <input
-                      type="checkbox"
-                      checked={updateAutoInstallWhenIdle}
-                      onChange={(e) => setUpdateAutoInstallWhenIdle(e.target.checked)}
-                    />
-                    <span>Auto-install updates when idle (2+ min, not listening)</span>
-                  </label>
-                  <label className="settings-field">
-                    <span>Repository</span>
-                    <input
-                      className="settings-input"
-                      value={updateRepoSlug}
-                      onChange={(e) => setUpdateRepoSlug(e.target.value)}
-                      placeholder="owner/repo"
-                    />
-                  </label>
-                  <div className="settings-inline-actions">
-                    <button
-                      className="action-btn"
-                      onClick={() => void handleCheckForUpdates({ silent: false, ignoreDeferrals: true })}
-                      disabled={isCheckingUpdate}
-                    >
-                      {isCheckingUpdate ? "Checking..." : "Check for updates"}
-                    </button>
-                    <button
-                      className="action-btn"
-                      onClick={() => void handleInstallUpdate({ source: "manual", autoExit: false })}
-                      disabled={isInstallingUpdate || !updateInfo?.hasUpdate || !updateInfo?.assetDownloadUrl || !updateInfo?.expectedInstallerSha256}
-                    >
-                      {isInstallingUpdate ? "Launching..." : "Install available update"}
-                    </button>
-                    <button className="action-btn" onClick={handleRemindLater} disabled={!updateInfo?.hasUpdate}>
-                      Remind Later
-                    </button>
-                    <button className="action-btn" onClick={handleSkipUpdateVersion} disabled={!updateInfo?.hasUpdate}>
-                      Skip This Version
-                    </button>
-                    <button className="action-btn" onClick={clearUpdateDeferrals}>
-                      Clear Skip/Snooze
-                    </button>
-                    {updateInfo?.htmlUrl && (
-                      <a className="action-btn" href={updateInfo.htmlUrl} target="_blank" rel="noreferrer">
-                        Open release page
-                      </a>
-                    )}
-                    <button className="action-btn" onClick={() => void handleExportUpdateTelemetry()}>
-                      {updateLogCopied === "done"
-                        ? "Log Copied"
-                        : updateLogCopied === "error"
-                          ? "Copy Failed"
-                          : "Copy Update Log"}
-                    </button>
-                  </div>
-                  <p className="settings-note">
-                    Last checked: {updateLastCheckedAt ? new Date(updateLastCheckedAt).toLocaleString() : "never"}.
-                  </p>
-                  <p className="settings-note">
-                    {updateSkipVersion ? `Skipped version: ${updateSkipVersion}. ` : ""}
-                    {updateRemindUntilMs > Date.now()
-                      ? `Snoozed until ${new Date(updateRemindUntilMs).toLocaleString()}.`
-                      : "No active snooze."}
-                  </p>
-                  <p className="settings-note">
-                    Current version: {currentAppVersion}.
-                    {updateInfo
-                      ? updateInfo.hasUpdate
-                        ? ` Latest: ${updateInfo.latestVersion}.`
-                        : " Already up to date."
-                      : " Check to fetch latest release metadata."}
-                  </p>
-                  <p className="settings-note">
-                    {updateInfo
-                      ? updateInfo.expectedInstallerSha256
-                        ? `Installer hash verified from ${updateInfo.checksumAssetName ?? "SHA256SUMS.txt"} before launch.`
-                        : "Installer verification data unavailable: update install is blocked."
-                      : "No update metadata loaded yet."}
-                  </p>
-                  {updateInfo?.releaseNotes && (
-                    <p className="settings-note">
-                      {updateInfo.releaseNotes.slice(0, 260)}
-                      {updateInfo.releaseNotes.length > 260 ? "..." : ""}
-                    </p>
-                  )}
-                  <div className="panel-list update-telemetry-list">
-                    {updateTelemetry.slice(0, 8).map((entry) => (
-                      <article key={entry.id} className="panel-card">
-                        <div className="panel-meta">
-                          <span>{new Date(entry.at).toLocaleString()}</span>
-                          <span>{entry.source}</span>
-                          <span>{entry.event}</span>
-                        </div>
-                        <p>{entry.detail}</p>
-                      </article>
-                    ))}
-                    {updateTelemetry.length === 0 && (
-                      <p className="settings-note">No updater events logged yet.</p>
-                    )}
-                  </div>
-                </article>
+                <PrivacySection
+                  openAiApiKeyInput={openAiApiKeyInput}
+                  hasOpenAiApiKey={hasOpenAiApiKey}
+                  cloudMode={cloudMode}
+                  cloudModeOptions={CLOUD_MODE_OPTIONS}
+                  historyEnabled={historyEnabled}
+                  guidedTuneCompletedForDevice={guidedTuneCompletedForDevice}
+                  guidedTuneProgressPct={guidedTuneProgressPct}
+                  guidedTuneStepLabel={guidedTuneStepLabel ?? "Ready to calibrate"}
+                  guidedTuneInstruction={guidedTuneInstruction ?? "Press Guided Voice Tune to start the scripted calibration."}
+                  guidedTuneSentence={guidedTuneSentence}
+                  runtimeMsg={runtimeMsg}
+                  calibrationMsg={calibrationMsg}
+                  onOpenAiApiKeyInputChange={setOpenAiApiKeyInput}
+                  onCloudModeChange={setCloudMode}
+                  onHistoryEnabledChange={setHistoryEnabled}
+                  onClearSavedKey={() => applyRuntime({ openAiApiKey: "" })}
+                />
+
+                <AppUpdatesSection
+                  updateAutoCheckEnabled={updateAutoCheckEnabled}
+                  updateAutoInstallWhenIdle={updateAutoInstallWhenIdle}
+                  updateRepoSlug={updateRepoSlug}
+                  isCheckingUpdate={isCheckingUpdate}
+                  isInstallingUpdate={isInstallingUpdate}
+                  updateInfo={updateInfo}
+                  updateLogCopied={updateLogCopied}
+                  updateLastCheckedAt={updateLastCheckedAt}
+                  updateSkipVersion={updateSkipVersion}
+                  updateRemindUntilMs={updateRemindUntilMs}
+                  currentAppVersion={currentAppVersion}
+                  updateTelemetry={updateTelemetry}
+                  onUpdateAutoCheckEnabledChange={setUpdateAutoCheckEnabled}
+                  onUpdateAutoInstallWhenIdleChange={setUpdateAutoInstallWhenIdle}
+                  onUpdateRepoSlugChange={setUpdateRepoSlug}
+                  onCheckForUpdates={() => handleCheckForUpdates({ silent: false, ignoreDeferrals: true })}
+                  onInstallUpdate={() => handleInstallUpdate({ source: "manual", autoExit: false })}
+                  onRemindLater={handleRemindLater}
+                  onSkipThisVersion={handleSkipUpdateVersion}
+                  onClearDeferrals={clearUpdateDeferrals}
+                  onExportUpdateTelemetry={handleExportUpdateTelemetry}
+                />
               </div>
             </section>
           )}
@@ -2578,103 +2454,48 @@ export default function Home() {
         )}
       </AnimatePresence>
 
-      {showOnboarding && (
-        <div className="onboarding-backdrop" data-no-drag>
-          <section className="onboarding-modal">
-            <span className="settings-kicker">First Launch</span>
-            <h2>Welcome to Dictum</h2>
-            <p>Set your keybind, transcription defaults, and cloud preference before starting.</p>
-
-            <div className="settings-fields">
-              <label className="settings-field">
-                <span>Toggle Shortcut</span>
-                <input
-                  className="settings-input"
-                  value={toggleShortcut}
-                  onChange={(e) => setToggleShortcut(e.target.value)}
-                  placeholder="Ctrl+Shift+Space"
-                />
-              </label>
-              <label className="settings-field">
-                <span>Model</span>
-                <select className="settings-input" value={modelProfile} onChange={(e) => handleModelProfileChange(e.target.value)}>
-                  {MODEL_PROFILE_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {recommendedModelMeta && modelRecommendation && (
-                <div className="settings-inline-actions">
-                  <button className="action-btn" onClick={applyRecommendedModel}>
-                    Use Recommended ({recommendedModelMeta.label})
-                  </button>
-                  <span className="settings-note">{modelRecommendation.reason}</span>
-                </div>
-              )}
-              <label className="settings-field">
-                <span>Performance</span>
-                <select className="settings-input" value={performanceProfile} onChange={(e) => setPerformanceProfile(e.target.value)}>
-                  {PERFORMANCE_PROFILE_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="settings-field">
-                <span>Cloud Mode</span>
-                <select className="settings-input" value={cloudMode} onChange={(e) => setCloudMode(e.target.value as CloudMode)}>
-                  {CLOUD_MODE_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <label className="settings-field">
-              <span>OpenAI API Key (optional)</span>
-              <input
-                className="settings-input"
-                type="password"
-                value={openAiApiKeyInput}
-                onChange={(e) => setOpenAiApiKeyInput(e.target.value)}
-                placeholder={hasOpenAiApiKey ? "Saved locally. Enter new key to replace." : "sk-proj-..."}
-                autoComplete="off"
-              />
-            </label>
-
-            <label className="settings-switch">
-              <input type="checkbox" checked={reliabilityMode} onChange={(e) => setReliabilityMode(e.target.checked)} />
-              <span>Enable reliability mode (recommended)</span>
-            </label>
-
-            <div className="settings-inline-actions">
-              <button className="action-btn" onClick={() => void runMicCalibration()} disabled={isCalibrating}>
-                {isCalibrating ? "Running diagnostics..." : "Run mic diagnostics"}
-              </button>
-              <button className="action-btn" onClick={() => void runBenchmarkTune()} disabled={isBenchmarkTuning}>
-                {isBenchmarkTuning ? "Benchmarking..." : "Run benchmark tune"}
-              </button>
-              <button className="action-btn settings-save-btn" onClick={() => void completeOnboarding()}>
-                Finish Setup
-              </button>
-              {onboardingCompleted && (
-                <button className="action-btn" onClick={() => setShowOnboarding(false)}>
-                  Close
-                </button>
-              )}
-            </div>
-
-            <p className="settings-note">
-              {runtimeMsg ?? "You can re-open this onboarding anytime from Settings."}
-            </p>
-          </section>
-        </div>
-      )}
+      <OnboardingModal
+        visible={showOnboarding}
+        toggleShortcut={toggleShortcut}
+        modelProfile={modelProfile}
+        performanceProfile={performanceProfile}
+        dictationMode={dictationMode}
+        cloudMode={cloudMode}
+        openAiApiKeyInput={openAiApiKeyInput}
+        hasOpenAiApiKey={hasOpenAiApiKey}
+        reliabilityMode={reliabilityMode}
+        onboardingCompleted={onboardingCompleted}
+        guidedTuneCompletedForDevice={guidedTuneCompletedForDevice}
+        guidedTuneProgressPct={guidedTuneProgressPct}
+        guidedTuneStepLabel={guidedTuneStepLabel ?? "About 30 seconds"}
+        guidedTuneInstruction={
+          guidedTuneInstruction ??
+          "This is required for first-run setup so whisper and normal speech both behave correctly."
+        }
+        guidedTuneSentence={guidedTuneSentence}
+        runtimeMsg={runtimeMsg}
+        calibrationMsg={calibrationMsg}
+        isCalibrating={isCalibrating}
+        isBenchmarkTuning={isBenchmarkTuning}
+        modelProfileOptions={MODEL_PROFILE_OPTIONS}
+        performanceProfileOptions={PERFORMANCE_PROFILE_OPTIONS}
+        dictationModeOptions={DICTATION_MODE_OPTIONS}
+        cloudModeOptions={CLOUD_MODE_OPTIONS}
+        recommendedModelLabel={recommendedModelMeta?.label ?? null}
+        modelRecommendationReason={modelRecommendation?.reason ?? null}
+        onToggleShortcutChange={setToggleShortcut}
+        onModelProfileChange={handleModelProfileChange}
+        onApplyRecommendedModel={applyRecommendedModel}
+        onPerformanceProfileChange={setPerformanceProfile}
+        onDictationModeChange={setDictationMode}
+        onCloudModeChange={setCloudMode}
+        onOpenAiApiKeyInputChange={setOpenAiApiKeyInput}
+        onReliabilityModeChange={setReliabilityMode}
+        onRunMicCalibration={runMicCalibration}
+        onRunBenchmarkTune={runBenchmarkTune}
+        onCompleteOnboarding={completeOnboarding}
+        onClose={() => setShowOnboarding(false)}
+      />
     </div>
   );
 }
